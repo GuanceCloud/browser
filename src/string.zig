@@ -17,7 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
+const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const M = @This();
 
@@ -177,16 +179,24 @@ pub const String = packed struct {
             return false;
         }
 
-        const len = a.len;
-        if (len < 0 or b.len < 0) {
+        if (a.len < 0 or b.len < 0) {
             return false;
         }
+        return eqlWithSameLen(a, b);
+    }
 
+    // Dangerous. Use this only when you have to (and, obviously, when you know
+    // a.len == b.len)
+    pub fn eqlWithSameLen(a: String, b: String) bool {
+        if (comptime IS_DEBUG) {
+            std.debug.assert(a.len == b.len);
+        }
+
+        const len = a.len;
         if (len <= 12) {
             return a.payload.content == b.payload.content;
         }
 
-        // a.len == b.len at this point
         const al: usize = @intCast(len);
         const bl: usize = @intCast(len);
         const ap: [*]const u8 = @ptrFromInt(a.payload.heap.ptr);
@@ -422,6 +432,40 @@ pub fn capBytes(allocator: std.mem.Allocator, bytes: []const u8, max_bytes: usiz
     return std.mem.concat(allocator, u8, &.{ prefix, suffix }) catch prefix;
 }
 
+/// Reinterprets `bytes` as Latin-1 (each byte one codepoint) and encodes it
+/// as UTF-8. For bytes that aren't valid UTF-8 but must become a valid UTF-8
+/// string (JSON, filenames).
+pub fn latin1ToUtf8(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var extra: usize = 0;
+    for (bytes) |b| {
+        if (b >= 0x80) {
+            extra += 1;
+        }
+    }
+    if (comptime IS_DEBUG) {
+        // The way this is currently used:
+        // 1 - the caller always wants the value duped,
+        // 2 - the caller only got here because utf8ValidateSlice failed.
+        // If both of those ever change, maybe it's worth reconsidering whether
+        // this API unconditionally dupes.
+        std.debug.assert(extra != 0);
+    }
+
+    const out = try allocator.alloc(u8, bytes.len + extra);
+    var i: usize = 0;
+    for (bytes) |b| {
+        if (b < 0x80) {
+            out[i] = b;
+            i += 1;
+        } else {
+            out[i] = 0xC0 | (b >> 6);
+            out[i + 1] = 0x80 | (b & 0x3F);
+            i += 2;
+        }
+    }
+    return out;
+}
+
 // Discriminatory type that signals the bridge to use arena instead of call_arena
 // Use this for strings that need to persist beyond the current call
 // The caller can unwrap and store just the underlying .str field
@@ -481,6 +525,20 @@ test "capBytes: appends a marker, keeps valid UTF-8" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(out));
     try std.testing.expect(std.mem.startsWith(u8, out, "aaaaaaa"));
     try std.testing.expect(std.mem.indexOf(u8, out, "truncated, original 13 bytes") != null);
+}
+
+test "latin1ToUtf8" {
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "caf\xE9.txt", .out = "café.txt" },
+        .{ .in = "report\xFF.csv", .out = "report\xC3\xBF.csv" },
+        .{ .in = "\x82\xd3\x82\xe9.xlsx", .out = "\xC2\x82\xC3\x93\xC2\x82\xC3\xA9.xlsx" },
+    };
+    for (cases) |case| {
+        const out = try latin1ToUtf8(testing.allocator, case.in);
+        defer testing.allocator.free(out);
+        try testing.expectEqual(case.out, out);
+        try testing.expectEqual(true, std.unicode.utf8ValidateSlice(out));
+    }
 }
 
 test "String" {
