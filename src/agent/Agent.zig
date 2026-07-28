@@ -1914,9 +1914,9 @@ fn recordSlashToolCall(
         .arguments = if (args) |v| try zenai.json.dupeValue(ma, v) else null,
     };
 
-    // capBytes returns its input unchanged under the cap; dupe so content
+    // capToolOutput returns its input unchanged under the cap; dupe so content
     // doesn't alias the caller's per-iteration arena.
-    const capped = string.capBytes(ma, result.text, tool_output_max_bytes);
+    const capped = capToolOutput(ma, tool_name, result.text);
     const content = if (capped.ptr == result.text.ptr) try ma.dupe(u8, capped) else capped;
 
     const tool_results = try ma.alloc(zenai.provider.ToolResult, 1);
@@ -2188,9 +2188,25 @@ fn buildUserMessageParts(
     return parts.toOwnedSlice(ma);
 }
 
-// Cap per-call tool output so heavy pages don't balloon the message arena (and
-// the next request body) without bound.
-const tool_output_max_bytes: usize = 1 * 1024 * 1024;
+// Tool results are re-sent with every subsequent turn, so an unscoped read of
+// a huge page is paid once per remaining turn — the cap bounds that growth.
+// `extract` is exempt up to the loose backstop: its output is schema-shaped
+// JSON the model explicitly asked for, and truncation would corrupt it.
+const tool_output_max_bytes: usize = 64 * 1024;
+const extract_output_max_bytes: usize = 1024 * 1024;
+
+fn toolOutputCap(tool_name: []const u8) usize {
+    return if (std.mem.eql(u8, tool_name, "extract")) extract_output_max_bytes else tool_output_max_bytes;
+}
+
+fn capToolOutput(allocator: std.mem.Allocator, tool_name: []const u8, output: []const u8) []const u8 {
+    const cap = toolOutputCap(tool_name);
+    if (output.len <= cap) return output;
+    const prefix = string.truncateUtf8(output, cap);
+    var suffix_buf: [128]u8 = undefined;
+    const suffix = std.fmt.bufPrint(&suffix_buf, "\n...[truncated, original {d} bytes — re-read scoped (selector/backendNodeId)]", .{output.len}) catch return prefix;
+    return std.mem.concat(allocator, u8, &.{ prefix, suffix }) catch prefix;
+}
 
 fn handleToolCall(ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8, arguments: ?std.json.Value) zenai.provider.Client.ToolHandler.Result {
     const self: *Agent = @ptrCast(@alignCast(ctx));
@@ -2209,7 +2225,7 @@ fn handleToolCall(ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []co
     defer self.terminal.spinner.setThinking();
 
     const outcome: zenai.provider.Client.ToolHandler.Result = if (self.callTool(allocator, tool_name, arguments)) |result|
-        .{ .content = string.capBytes(allocator, result.text, tool_output_max_bytes), .is_error = result.is_error }
+        .{ .content = capToolOutput(allocator, tool_name, result.text), .is_error = result.is_error }
     else |err|
         .{ .content = std.fmt.allocPrint(allocator, "Error: {s}", .{@errorName(err)}) catch "Error: tool execution failed", .is_error = true };
 
@@ -2364,4 +2380,47 @@ test "savePrompt: save instructions followed by the rendered script skill" {
     const revision = savePrompt(true);
     try std.testing.expect(std.mem.indexOf(u8, revision, save_revision_note) != null);
     try std.testing.expect(std.mem.endsWith(u8, revision, lp.skill.text()));
+}
+
+test "capToolOutput: passes through when under cap" {
+    const ta = std.testing.allocator;
+    const out = capToolOutput(ta, "markdown", "short");
+    try std.testing.expectEqualStrings("short", out);
+}
+
+// Boundary correctness lives in string.zig's `truncateUtf8` tests; here we only
+// assert the agent-specific policy: an over-cap body keeps valid UTF-8 and gains
+// the truncation marker.
+test "capToolOutput: appends a marker when truncating" {
+    const ta = std.testing.allocator;
+
+    // 3-byte Hangul codepoint (U+D55C '한' = 0xED 0x95 0x9C) straddling the cap.
+    const cap = tool_output_max_bytes;
+    const buf = try ta.alloc(u8, cap + 8);
+    defer ta.free(buf);
+    @memset(buf[0 .. cap - 1], 'a');
+    buf[cap - 1] = 0xED;
+    buf[cap + 0] = 0x95;
+    buf[cap + 1] = 0x9C;
+    @memset(buf[cap + 2 ..], 'b');
+
+    const out = capToolOutput(ta, "markdown", buf);
+    defer if (out.ptr != buf.ptr) ta.free(out);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expect(std.mem.indexOf(u8, out, "truncated") != null);
+}
+
+test "capToolOutput: extract is exempt from the default cap" {
+    const ta = std.testing.allocator;
+
+    const buf = try ta.alloc(u8, tool_output_max_bytes + 8);
+    defer ta.free(buf);
+    @memset(buf, 'a');
+
+    const out = capToolOutput(ta, "extract", buf);
+    try std.testing.expect(out.ptr == buf.ptr);
+
+    try std.testing.expectEqual(extract_output_max_bytes, toolOutputCap("extract"));
+    try std.testing.expectEqual(tool_output_max_bytes, toolOutputCap("html"));
 }

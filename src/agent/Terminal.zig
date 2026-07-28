@@ -25,9 +25,7 @@ const Spinner = @import("Spinner.zig");
 const md_term = @import("md_term.zig");
 const prompt_assist = @import("prompt_assist.zig");
 const ansi = @import("ansi.zig");
-const c = @cImport({
-    @cInclude("isocline.h");
-});
+const c = @import("isocline");
 
 const Terminal = @This();
 
@@ -269,7 +267,7 @@ pub fn endAssistantStream(self: *Terminal) void {
 
 // Must exceed the downstream LLM-judge's snapshot window for full grounding
 // evidence. Does not cap the agent's own LLM, which gets up to
-// tool_output_max_bytes (1 MiB) via string.zig:capBytes. Bypassed in REPL
+// tool_output_max_bytes (1 MiB) via Agent.zig:capToolOutput. Bypassed in REPL
 // where the human can scroll.
 const max_result_display_len = 2000;
 

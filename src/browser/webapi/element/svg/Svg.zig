@@ -70,11 +70,11 @@ pub fn getY(self: *Svg, frame: *Frame) !*AnimatedLength {
 }
 
 pub fn getWidth(self: *Svg, frame: *Frame) !*AnimatedLength {
-    return AnimatedLength.getOrCreate(self.asElement(), .width, frame);
+    return AnimatedLength.getOrCreate(self.asElement(), .svg_width, frame);
 }
 
 pub fn getHeight(self: *Svg, frame: *Frame) !*AnimatedLength {
-    return AnimatedLength.getOrCreate(self.asElement(), .height, frame);
+    return AnimatedLength.getOrCreate(self.asElement(), .svg_height, frame);
 }
 
 pub fn getPreserveAspectRatio(self: *Svg, frame: *Frame) !*AnimatedPreserveAspectRatio {
@@ -102,7 +102,7 @@ pub fn createSVGRect(_: *Svg, frame: *Frame) !*DOMRect {
 }
 
 pub fn createSVGNumber(_: *Svg, frame: *Frame) !*SvgNumber {
-    return frame._factory.create(SvgNumber{});
+    return SvgNumber.detached(frame);
 }
 
 pub fn createSVGLength(_: *Svg, frame: *Frame) !*SvgLength {
