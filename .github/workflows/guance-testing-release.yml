@@ -1,0 +1,105 @@
+name: Guance testing release
+
+on:
+  push:
+    branches:
+      - build/testing-d2d1efd7
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: testing-d2d1efd7
+  VERSION_FLAG: -Dversion=1.0.0-dev.guance.d2d1efd7
+
+jobs:
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            cpu_flag: -Dcpu=x86_64
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            cpu_flag: -Dcpu=generic
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/install
+        with:
+          os: linux
+          arch: ${{ matrix.arch }}
+
+      - name: Check formatting
+        run: zig fmt --check src/browser/webapi/element/html/Script.zig
+
+      - name: Run script regression test
+        env:
+          TEST_FILTER: "WebApi: Script#dynamic.html"
+        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a test -freference-trace
+
+      - name: Build V8 snapshot
+        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
+
+      - name: Build Lightpanda
+        run: >-
+          zig build
+          -Dsnapshot_path=../../snapshot.bin
+          -Dprebuilt_v8_path=v8/libc_v8.a
+          -Doptimize=ReleaseFast
+          ${{ matrix.cpu_flag }}
+          ${{ env.VERSION_FLAG }}
+
+      - name: Prepare binary
+        run: |
+          mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-linux
+          chmod 0755 lightpanda-${{ matrix.arch }}-linux
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lightpanda-${{ matrix.arch }}-linux
+          path: lightpanda-${{ matrix.arch }}-linux
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: lightpanda-*-linux
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum lightpanda-*-linux > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish prerelease
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        with:
+          allowUpdates: true
+          artifacts: "dist/*"
+          artifactErrorsFailBuild: true
+          commit: ${{ github.sha }}
+          makeLatest: false
+          prerelease: true
+          tag: ${{ env.RELEASE_TAG }}
+          body: |
+            GuanceCloud testing build for dynamic script loading via `setAttribute("src", ...)`.
+
+            Source fix: d2d1efd70325e323a467d9f0487dfb30f11669af
