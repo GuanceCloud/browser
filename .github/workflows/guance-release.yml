@@ -1,0 +1,116 @@
+name: Guance release build
+
+on:
+  push:
+    tags:
+      - "*-g*"
+  pull_request:
+    paths:
+      - ".github/workflows/guance-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-ref:
+    name: validate release ref
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Require tags to point to main history
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  build-linux:
+    name: build linux ${{ matrix.arch }}
+    needs: validate-ref
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            cpu_flag: -Dcpu=x86_64
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            cpu_flag: -Dcpu=generic
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/install
+        with:
+          os: linux
+          arch: ${{ matrix.arch }}
+
+      - name: Build V8 snapshot
+        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
+
+      - name: Build Lightpanda
+        env:
+          VERSION_FLAG: ${{ github.ref_type == 'tag' && format('-Dversion={0}', github.ref_name) || '-Dversion=nightly' }}
+        run: >-
+          zig build
+          -Dsnapshot_path=../../snapshot.bin
+          -Dprebuilt_v8_path=v8/libc_v8.a
+          -Doptimize=ReleaseFast
+          ${{ matrix.cpu_flag }}
+          ${{ env.VERSION_FLAG }}
+
+      - name: Prepare binary
+        run: |
+          mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-linux
+          chmod 0755 lightpanda-${{ matrix.arch }}-linux
+          ./lightpanda-${{ matrix.arch }}-linux version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lightpanda-${{ matrix.arch }}-linux
+          path: lightpanda-${{ matrix.arch }}-linux
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: lightpanda-*-linux
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum lightpanda-*-linux > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        with:
+          allowUpdates: false
+          artifacts: "dist/*"
+          artifactErrorsFailBuild: true
+          commit: ${{ github.sha }}
+          generateReleaseNotes: true
+          makeLatest: false
+          prerelease: true
+          tag: ${{ github.ref_name }}
