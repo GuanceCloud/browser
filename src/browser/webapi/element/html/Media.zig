@@ -17,11 +17,13 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const js = @import("../../../js/js.zig");
 const Frame = @import("../../../Frame.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
+const Factory = @import("../../../Factory.zig");
 const HtmlElement = @import("../Html.zig");
 const Event = @import("../../Event.zig");
 pub const Audio = @import("Audio.zig");
@@ -47,14 +49,36 @@ pub const NetworkState = enum(u16) {
     NETWORK_NO_SOURCE = 3,
 };
 
-pub const Type = union(enum) {
+pub const Type = enum(u8) {
     generic,
-    audio: *Audio,
-    video: *Video,
+    audio,
+    video,
 };
 
+// `.generic` maps to Media itself: a bare <media> chain ends at Media, so the
+// tag has no chain member of its own.
+pub fn Subtype(comptime tag: Type) type {
+    return switch (tag) {
+        .generic => Media,
+        .audio => Audio,
+        .video => Video,
+    };
+}
+
+pub fn subtype(self: *const Media, comptime T: type) *T {
+    const offset = comptime Factory.chainOffsetOf(T, T) - Factory.chainOffsetOf(T, Media);
+    const sub: *T = @ptrFromInt(@intFromPtr(self) + offset);
+    if (comptime lp.IS_DEBUG) {
+        // This pointer dance only works because the factory allocates the chain
+        // in a contiguous block of memory. In debug, we assert this holds via
+        // the _proto_canary back pointer.
+        std.debug.assert(Factory.protoOf(sub) == self);
+    }
+    return sub;
+}
+
 _type: Type,
-_proto: *HtmlElement,
+_proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
 _paused: bool = true,
 _current_time: f64 = 0,
 _volume: f64 = 1.0,
@@ -65,28 +89,20 @@ _network_state: NetworkState = .NETWORK_EMPTY,
 _error: ?*MediaError = null,
 
 pub fn asElement(self: *Media) *Element {
-    return self._proto._proto;
+    return Factory.protoOf(self).asElement();
 }
 pub fn asConstElement(self: *const Media) *const Element {
-    return self._proto._proto;
+    return Factory.protoOf(@constCast(self)).asElement();
 }
 pub fn asNode(self: *Media) *Node {
     return self.asElement().asNode();
 }
 
 pub fn is(self: *Media, comptime T: type) ?*T {
-    const type_name = @typeName(T);
     switch (self._type) {
-        .audio => |a| {
-            if (T == *Audio) return a;
-            if (comptime std.mem.startsWith(u8, type_name, "browser.webapi.element.html.Audio")) {
-                return a;
-            }
-        },
-        .video => |v| {
-            if (T == *Video) return v;
-            if (comptime std.mem.startsWith(u8, type_name, "browser.webapi.element.html.Video")) {
-                return v;
+        inline .audio, .video => |tag| {
+            if (Subtype(tag) == T) {
+                return self.subtype(T);
             }
         },
         .generic => {},

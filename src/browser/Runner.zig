@@ -79,7 +79,7 @@ pub fn waitForFrameCDP(self: *Runner, frame_id: u32, timeout_ms: u32, until: lp.
 pub fn waitForAll(self: *Runner, timeout_ms: u32, opts: WaitForFrameOpts) !void {
     const session = self.session;
     const arena = try session.getArena(.tiny, "Runner.waitForAll");
-    defer session.releaseArena(arena);
+    defer arena.release();
 
     var pages_to_wait: usize = 0;
     for (session.pages.items) |page| {
@@ -118,10 +118,9 @@ fn _wait(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
     const timer: std.Io.Timestamp = .now(io, .boot);
 
     // Periodic V8 GC hint during long waits. V8 is otherwise only nudged on
-    // session/page teardown (Browser.zig, Page.zig), so a page that stays
+    // session/page teardown (Session.zig, Page.zig), so a page that stays
     // alive for seconds while running heavy JS accumulates wrappers and
-    // external-ref'd Zig allocations V8 has no reason to drop. `.moderate`
-    // speeds up incremental GC without stalling the tick.
+    // external-ref'd Zig allocations V8 has no reason to drop.
     const gc_hint_period_ns: u64 = std.time.ns_per_s * 5;
     var gc_hint_timer: std.Io.Timestamp = .now(io, .boot);
 
@@ -205,6 +204,7 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
     const session = self.session;
     const browser = self.browser;
     const http_client = self.http_client;
+    defer browser.flushArenaMemory();
 
     // Arms the watchdog (and proves liveness): a stall anywhere in this tick
     // ages this stamp until the watchdog fires.
@@ -229,6 +229,18 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
 
     const network_idle = activity.idle();
     const is_done = browser.hasMacrotasks() == false and network_idle;
+
+    // Outside the condition loop: it skips resolved conditions, but an idle
+    // notification needs a check 500ms+ after the hold starts, and on a quiet
+    // page one tick both starts the hold and resolves the condition. Before
+    // it, so `.networkidle` conditions read fresh state.
+    var page_index: usize = 0;
+    while (page_index < session.pages.items.len) : (page_index += 1) {
+        // Indexed: notifyNetworkIdle dispatches to listeners.
+        const page = session.pages.items[page_index];
+        if (page.replacement != null) continue; // frozen; the replacement is live
+        page.frame.checkIdleNotifications(total_http_activity);
+    }
 
     // _we_ have nothing to run, but v8 is working on background tasks. We'll
     // wait for them. Don't do this for CDP, since new CDP messages can always
@@ -272,8 +284,6 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
                 }
             },
             .html, .complete => {
-                frame.checkIdleNotifications(total_http_activity);
-
                 const met = switch (condition.until) {
                     .done => is_done,
                     .domcontentloaded => frame._load_state == .load or frame._load_state == .complete,
@@ -296,6 +306,8 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
         }
     }
 
+    // Always taken for is_cdp and every exit returns .ok, so _tick never yields
+    // .done to the CDP pump: _wait's .done/is_cdp arm is dormant.
     if ((comptime is_cdp) or want_http_tick) {
         const ms_to_next_task = blk: {
             if (has_runnable_page == false) {
@@ -332,10 +344,10 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
 pub fn waitForSelector(self: *Runner, frame_id: u32, input: [:0]const u8, timeout_ms: u32) !*Node.Element {
     const session = self.session;
     const arena = try session.getArena(.small, "Runner.waitForSelector");
-    defer session.releaseArena(arena);
+    defer arena.release();
 
     const timer: std.Io.Timestamp = .now(lp.io, .boot);
-    const selector = try Selector.parseLeaky(arena, input);
+    const selector = try Selector.parseLeaky(arena.allocator(), input);
 
     while (true) {
         if (session.isCancelled()) {
@@ -473,7 +485,6 @@ test "Runner: waitForSelector timeout" {
 }
 
 test "Runner: waitForSelector" {
-    defer testing.reset();
     const page = try testing.pageTest("runner/runner1.html", .{});
 
     var runner = page.session.runner(.{});
@@ -543,4 +554,32 @@ test "Runner: lazy iframe does not delay the load event" {
     try runner.waitForFrame(page.frame_id, 3000, .{ .until = .done });
     try testing.expectEqual(true, lazy_child._load_state == .complete);
     try testing.expectEqual(true, lazy_child._parent_notified);
+}
+
+test "Runner: idle notifications advance past a resolved condition" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+
+    // What a quiet page looks like one tick in: the hold has started, and the
+    // same tick resolved the wait condition. Seeded past the 500ms hold so the
+    // test doesn't spend it.
+    const held_since = lp.datetime.milliTimestamp(.boot) -| 600;
+    frame._notified_network_idle = .{ .triggered = held_since };
+    frame._notified_network_almost_idle = .{ .triggered = held_since };
+
+    var conditions = [_]WaitCondition{.{
+        .frame_id = page.frame_id,
+        .until = .done,
+        .status = .complete,
+    }};
+
+    // is_cdp mirrors CDP.pageWait, which keeps ticking after the condition
+    // resolves.
+    var runner = page.session.runner(.{});
+    _ = try runner._wait(true, 50, &conditions);
+
+    try testing.expectEqual(true, frame._notified_network_idle == .done);
+    try testing.expectEqual(true, frame._notified_network_almost_idle == .done);
 }

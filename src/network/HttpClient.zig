@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const Inbox = @import("../Inbox.zig");
 const ArenaPool = @import("../ArenaPool.zig");
@@ -27,6 +26,7 @@ const Notification = @import("../Notification.zig");
 const CDP = @import("../cdp/CDP.zig");
 const Watchdog = @import("../Watchdog.zig");
 const URL = @import("../browser/URL.zig");
+const referrer = @import("../browser/referrer.zig");
 const WebSocket = @import("../browser/webapi/net/WebSocket.zig");
 const CookieJar = @import("../browser/webapi/storage/Cookie.zig").Jar;
 
@@ -39,11 +39,9 @@ pub const BlockPattern = UrlBlocklist.Pattern;
 
 const log = lp.log;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = builtin.mode == .Debug;
 
 pub const Method = http.Method;
 pub const Header = http.Header;
-pub const Headers = http.Headers;
 pub const HeaderIterator = http.HeaderIterator;
 
 // This is loosely tied to a browser Frame. Loading all the <scripts>, doing
@@ -138,10 +136,9 @@ use_proxy: bool,
 tls_verify: bool = true,
 
 // User agent override set via CDP Emulation.setUserAgentOverride.
-// When set, takes precedence over the config's http_headers values.
-// Both fields are allocated from self.allocator when set, null otherwise.
+// When set, takes precedence over the config's http_headers value.
+// Allocated from self.allocator when set, null otherwise.
 user_agent_override: ?[:0]const u8 = null,
-user_agent_header_override: ?[:0]const u8 = null,
 
 // The CDP layer we dispatch inbox messages to. Set in CDP.init for
 // `serve` mode; null in all other modes. Since this is set early, BEFORE the
@@ -235,7 +232,7 @@ pub fn deinit(self: *Client) void {
     self.abort();
     self.processGraveyard();
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         lp.assert(
             self.dispatch_count == 0,
             "dispatch_count must be 0",
@@ -259,7 +256,7 @@ pub fn deinit(self: *Client) void {
     self.robots.deinit();
     self.blocking_requests.deinit(self.allocator);
     self.transfers.deinit(self.allocator);
-    self.inbox.deinit(self.arena_pool);
+    self.inbox.deinit();
 }
 
 // Look up a live transfer by its id. Returns null if the transfer has been
@@ -276,17 +273,10 @@ pub fn incrReqId(self: *Client) u32 {
     return id;
 }
 
-// Set a user agent override. Both the raw UA string and the pre-formatted
-// "User-Agent: <ua>" header string are allocated from self.allocator.
+// Set a user agent override, allocated from self.allocator.
 pub fn setUserAgentOverride(self: *Client, ua: []const u8) !void {
     self.clearUserAgentOverride();
-
-    const override = try self.allocator.dupeZ(u8, ua);
-    errdefer self.allocator.free(override);
-
-    const header = try std.fmt.allocPrintSentinel(self.allocator, "User-Agent: {s}", .{ua}, 0);
-    self.user_agent_override = override;
-    self.user_agent_header_override = header;
+    self.user_agent_override = try self.allocator.dupeZ(u8, ua);
 }
 
 // Clear any user agent override, restoring the default from config.
@@ -294,10 +284,6 @@ pub fn clearUserAgentOverride(self: *Client) void {
     if (self.user_agent_override) |ua| {
         self.allocator.free(ua);
         self.user_agent_override = null;
-    }
-    if (self.user_agent_header_override) |uah| {
-        self.allocator.free(uah);
-        self.user_agent_header_override = null;
     }
 }
 
@@ -389,13 +375,19 @@ fn isUrlBlocked(self: *const Client, url: []const u8, internal: bool) bool {
     return blocklist.isBlocked(url);
 }
 
-pub fn newHeaders(self: *const Client) !http.Headers {
-    const ua_header = self.user_agent_header_override orelse self.network.config.http_headers.user_agent_header;
-    return http.Headers.init(ua_header);
-}
-
 pub fn getUserAgent(self: *const Client) [:0]const u8 {
     return self.user_agent_override orelse self.network.config.http_headers.user_agent;
+}
+
+// Headers _all_ requests include.
+pub fn baselineHeaders(self: *const Client) [3]http.Header {
+    return .{
+        .{ .name = "User-Agent", .value = self.getUserAgent() },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        // Omitting Accept-Language triggers bot-protection on some CDNs
+        // (Akamai) when Accept-Encoding is present.
+        .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
+    };
 }
 
 pub fn abort(self: *Client) void {
@@ -421,7 +413,7 @@ pub fn abort(self: *Client) void {
     // catch the regression rather than silently leaking on next use.
     // ws_dispatch_queue drains through owner teardown (abortOwner -> kill),
     // which precedes Client.deinit.
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(self.transfers.size == 0);
         std.debug.assert(self.pending_queue.first == null);
         std.debug.assert(self.dispatch_queue.first == null);
@@ -440,7 +432,7 @@ fn processGraveyard(self: *Client) void {
     while (self.graveyard.popFirst()) |node| {
         const transfer: *Transfer = @fieldParentPtr("_node", node);
         const arena = transfer.arena;
-        self.arena_pool.release(arena);
+        arena.release();
     }
 }
 
@@ -458,7 +450,7 @@ pub fn abortOwner(self: *Client, owner: *Owner) void {
         const ws: *WebSocket = @fieldParentPtr("_owner_node", node);
         ws.kill();
     }
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(owner.websockets.first == null);
     }
 }
@@ -524,35 +516,31 @@ pub fn activity(self: *const Client) Activity {
 //                Cherry-pick only Fetch interception responses
 const DrainMode = enum { all, sync_wait };
 
-// One-shot convenience: create and submit in a single call. HttpClient takes
-// ownership of req.headers; do not pair with `errdefer headers.deinit()`.
-// Callers that have no headers of their own can leave req.headers at its
-// (empty) default — the client fills in its baseline headers (user agent,
-// etc.).
+// One-shot convenience: create and submit in a single call.
 pub fn request(self: *Client, req: Request, owner: ?*Owner) anyerror!void {
     const transfer = try self.newRequest(req, owner);
     return transfer.submit();
 }
 
 // Create a request without submitting it. The caller owns the returned
-// transfer until transfer.submit().  On error, header is freed. On success,
-// headers is owned by the transfer.
+// transfer until transfer.submit() consumes it (or until syncRequest, which
+// consumes it the same way): it can add headers and mutate transfer.req,
+// scoped as:
+//
+//   const transfer = try client.newRequest(.{...}, owner);
+//   {
+//       errdefer transfer.deinit();
+//       try transfer.addHeader("Blah", "x", .{});
+//   }
+//   try transfer.submit();
+//
+// The errdefer must cover the mutation only, never submit itself.
 pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfer {
-    const arena = self.arena_pool.acquire(.small, "Request.arena") catch |err| {
-        req.headers.deinit();
-        return err;
-    };
+    const arena = try self.arena_pool.acquire(.small, "Request.arena");
 
     const transfer = blk: {
         var owned = req;
-        errdefer {
-            owned.headers.deinit();
-            self.arena_pool.release(arena);
-        }
-
-        if (owned.headers.headers == null) {
-            owned.headers = try self.newHeaders();
-        }
+        errdefer arena.release();
 
         // Most of the time, the req data will outlive the transfer. But not
         // always. The most problematic case is with a QueuedNavigation which
@@ -574,16 +562,6 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
             if (req.body_outlives_request == false) {
                 owned.body = try arena.dupe(u8, b);
             }
-
-            // Browsers never send Expect: 100-continue; libcurl generates it
-            // for HTTP/1.1 requests whose body exceeds 1MB
-            // (EXPECT_100_THRESHOLD), which stalls the request ~1s against
-            // servers/proxies that never answer the interim response. An
-            // empty value ("Expect:") suppresses the generated header. Only
-            // requests with a body can trigger it, and over HTTP/2 curl never
-            // generates it, so the entry is inert there. Added here (not
-            // configureConn) so redirect/auth retries don't append duplicates.
-            try owned.headers.add("Expect:");
         }
 
         const t = try arena.create(Transfer);
@@ -600,6 +578,7 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
             .owner = null,
             .owner_node = .{},
         };
+        try t.seedHeaders();
         break :blk t;
     };
 
@@ -682,7 +661,7 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
     // dispatch CDP commands
     try self.drainInbox(mode);
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         if (waited == false) {
             // we're about to tell our caller not to call us again without it
             // doing some work (e.g. running tasks). Let's assert that we were
@@ -708,7 +687,7 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
 // over.
 fn dispatchCompleted(self: *Client, mode: DrainMode) bool {
     if (mode == .all) {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             // .all never inside a syncRequest, so nothing can be gating requests.
             std.debug.assert(self.blocking_requests.count() == 0);
         }
@@ -836,7 +815,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
         .start => {
             if (self.network.web_bot_auth) |wba| {
                 const authority = URL.getHost(transfer.req.url);
-                try wba.signRequest(transfer.arena, &transfer.req.headers, authority);
+                try wba.signRequest(transfer, authority);
             }
 
             if (self.serve_mode) {
@@ -854,7 +833,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
                     // / abortParked.
                     self.intercepted += 1;
                     transfer.park(.intercept_request);
-                    if (comptime IS_DEBUG) {
+                    if (comptime lp.IS_DEBUG) {
                         log.debug(.http, "wait for interception", .{ .intercepted = self.intercepted });
                     }
                     return;
@@ -922,48 +901,53 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
     transfer._cache_key = req.url;
 
     const arena = transfer.arena;
-    var iter = req.headers.iterator();
-    const req_headers = try iter.collect(arena);
+    const req_headers = try arena.alloc(http.Header, transfer.req_headers.items.len);
+    for (transfer.req_headers.items, req_headers) |hdr, *out| {
+        out.* = .{ .name = hdr.name, .value = hdr.value };
+    }
 
-    const cached = cache.get(arena, .{
+    const cache_result = cache.get(arena.allocator(), .{
         .url = req.url,
         .timestamp = lp.datetime.timestamp(.real),
-        .request_headers = req_headers.items,
-    }) orelse {
-        lp.metrics.http_cache.incr(.miss);
-        transfer._cache_intent = .store;
-        return false;
+        .request_headers = req_headers,
+    }) catch |e| blk: {
+        log.err(.cache, "failed to get", .{ .url = req.url, .err = e });
+        break :blk .miss;
     };
 
-    if (cached.expired == false) {
-        lp.metrics.http_cache.incr(.hit);
-        try transfer.bufferCached(cached);
-        return true;
+    switch (cache_result) {
+        .hit => |cached| {
+            lp.metrics.http_cache.incr(.hit);
+            try transfer.bufferCached(cached);
+            return true;
+        },
+        .revalidate => |cached| {
+            log.debug(.cache, "revalidate cache entry", .{
+                .url = req.url,
+                .etag = cached.etag,
+                .last_modified = cached.last_modified,
+            });
+            if (cached.etag) |etag| {
+                try transfer.addHeader("If-None-Match", etag, .{});
+            }
+            if (cached.last_modified) |lm| {
+                try transfer.addHeader("If-Modified-Since", lm, .{});
+            }
+            transfer._cache_intent = .{ .revalidate = cached };
+            return false;
+        },
+        .miss => {
+            lp.metrics.http_cache.incr(.miss);
+            transfer._cache_intent = .store;
+            return false;
+        },
+        .stale => {
+            lp.metrics.http_cache.incr(.miss);
+            cache.evict(req.url);
+            transfer._cache_intent = .store;
+            return false;
+        },
     }
-
-    if (cached.metadata.hasValidators() == false) {
-        // Expired and no validators
-        lp.metrics.http_cache.incr(.miss);
-        cached.data.deinit();
-        cache.evict(req.url);
-        transfer._cache_intent = .store;
-        return false;
-    }
-
-    // expired but with validators
-    log.debug(.cache, "revalidate with etag", .{
-        .url = req.url,
-        .etag = cached.metadata.etag,
-        .last_modified = cached.metadata.last_modified,
-    });
-    if (cached.metadata.etag) |etag| {
-        try req.headers.add(try std.fmt.allocPrintSentinel(arena, "If-None-Match: {s}", .{etag}, 0));
-    }
-    if (cached.metadata.last_modified) |lm| {
-        try req.headers.add(try std.fmt.allocPrintSentinel(arena, "If-Modified-Since: {s}", .{lm}, 0));
-    }
-    transfer._cache_intent = .{ .revalidate = cached };
-    return false;
 }
 
 // 304 on a revalidation: renew the stored entry from the fresh headers and
@@ -982,7 +966,7 @@ fn cacheRevalidated(self: *Client, transfer: *Transfer) !bool {
     const stale = transfer._cache_intent.revalidate;
     transfer._cache_intent = .none;
 
-    cache.renew(transfer.arena, .{
+    cache.renew(transfer.arena.allocator(), .{
         .url = transfer._cache_key,
         .timestamp = lp.datetime.timestamp(.real),
         .headers = transfer.res.headers,
@@ -1020,8 +1004,8 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
     const headers = transfer.res.headers;
 
     const vary = findHeader(headers, "vary");
-    const maybe_cm = Cache.tryCache(
-        arena,
+    const maybe_req = Cache.tryCache(
+        arena.allocator(),
         lp.datetime.timestamp(.real),
         transfer._cache_key,
         rh.status,
@@ -1037,39 +1021,38 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
         log.warn(.http, "cache eligibility", .{ .err = err });
         return;
     };
-    var metadata = maybe_cm orelse return;
+    var req = maybe_req orelse return;
 
     var vary_headers: std.ArrayList(http.Header) = .empty;
     if (vary) |vary_str| {
-        var req_it = transfer.req.headers.iterator();
-        while (req_it.next()) |hdr| {
+        for (transfer.req_headers.items) |hdr| {
             var vary_iter = std.mem.splitScalar(u8, vary_str, ',');
             while (vary_iter.next()) |part| {
                 const name = std.mem.trim(u8, part, &std.ascii.whitespace);
                 if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
-                    const owned: http.Header = .{
-                        .name = arena.dupe(u8, hdr.name) catch return,
-                        .value = arena.dupe(u8, hdr.value) catch return,
-                    };
-                    vary_headers.append(arena, owned) catch return;
+                    // name/value already live in transfer.arena
+                    vary_headers.append(arena.allocator(), .{
+                        .name = hdr.name,
+                        .value = hdr.value,
+                    }) catch return;
                 }
             }
         }
     }
 
-    metadata.headers = headers;
-    metadata.vary_headers = vary_headers.items;
+    req.headers = headers;
+    req.vary_headers = vary_headers.items;
 
-    if (comptime IS_DEBUG) {
-        log.debug(.browser, "http cache", .{ .key = transfer._cache_key, .metadata = metadata });
+    if (comptime lp.IS_DEBUG) {
+        log.debug(.browser, "http cache", .{ .key = transfer._cache_key, .put = req });
     }
-    cache.put(metadata, transfer.res.buffer.items) catch |err| {
+    cache.put(req, transfer.res.buffer.items) catch |err| {
         log.warn(.http, "cache put failed", .{ .err = err });
     };
 }
 
 const SyncContext = struct {
-    allocator: Allocator,
+    client: *Client,
     completion: union(enum) {
         in_progress: void,
         done: void,
@@ -1080,19 +1063,35 @@ const SyncContext = struct {
     status: u16 = 0,
     body: std.ArrayList(u8),
 
+    // Acquired on the first byte we have to buffer, so a bodyless response
+    // never takes one. Ownership moves to the SyncResponse.
+    arena: ?*lp.Arena = null,
+
     fn headerCallback(transfer: *Transfer) anyerror!Transfer.HeaderResult {
         const self: *SyncContext = @ptrCast(@alignCast(transfer.req.ctx));
         lp.assert(transfer.responseStatus() != null, "HttpClient.SyncRequest.headerCallback", .{ .value = transfer.responseStatus() });
         self.status = transfer.responseStatus().?;
         if (transfer.getContentLength()) |cl| {
-            try self.body.ensureTotalCapacity(self.allocator, cl);
+            try self.body.ensureTotalCapacityPrecise(try self.bodyAllocator(cl), cl);
         }
         return .proceed;
     }
 
+    fn bodyAllocator(self: *SyncContext, content_length: ?usize) !Allocator {
+        if (self.arena) |arena| {
+            return arena.allocator();
+        }
+        const arena = if (content_length) |cl|
+            try self.client.arena_pool.acquire(cl, "syncRequest.body")
+        else
+            try self.client.arena_pool.acquire(.large, "syncRequest.body");
+        self.arena = arena;
+        return arena.allocator();
+    }
+
     fn dataCallback(transfer: *Transfer, data: []const u8) anyerror!void {
         const self: *SyncContext = @ptrCast(@alignCast(transfer.req.ctx));
-        try self.body.appendSlice(self.allocator, data);
+        try self.body.appendSlice(try self.bodyAllocator(null), data);
     }
 
     fn doneCallback(ctx: *anyopaque) anyerror!void {
@@ -1111,33 +1110,33 @@ const SyncContext = struct {
     }
 };
 
-pub fn syncRequest(self: *Client, allocator: Allocator, req: Request, owner: *Owner) !SyncResponse {
+// Synchronous submit for a transfer created with newRequest. Like `submit`,
+// `syncRequest` consuems the transfer unconditionally.
+// Caller must deinit SyncResponse or otherwise take ownership of its optional arena
+pub fn syncRequest(self: *Client, transfer: *Transfer) !SyncResponse {
     if (self.inbox.terminated) {
-        // request() takes ownership of req.headers on every path; we return
-        // before calling it, so free the curl_slist here to avoid leaking it.
-        req.deinit();
+        transfer.deinit();
         return error.ClientDisconnected;
     }
     // A parser can start another blocking script/style fetch while unwinding
     // a previous interrupted fetch. The first tickSync below would fail
-    // anyway; bail before creating the transfer and notifying CDP.
+    // anyway; bail before submitting and notifying CDP.
     if (self.hasPendingTeardown()) {
-        req.deinit();
+        transfer.deinit();
         return error.SyncWaitInterrupted;
     }
 
-    var sync_ctx = SyncContext{ .allocator = allocator, .body = .empty };
-    errdefer sync_ctx.body.deinit(allocator);
+    var sync_ctx = SyncContext{ .client = self, .body = .empty };
+    errdefer if (sync_ctx.arena) |arena| arena.release();
 
-    var r = req;
-    r.sync = true;
-    r.ctx = &sync_ctx;
-    r.header_callback = SyncContext.headerCallback;
-    r.data_callback = SyncContext.dataCallback;
-    r.done_callback = SyncContext.doneCallback;
-    r.error_callback = SyncContext.errorCallback;
-    r.shutdown_callback = SyncContext.shutdownCallback;
-    const transfer = try self.newRequest(r, owner);
+    const req = &transfer.req;
+    req.sync = true;
+    req.ctx = &sync_ctx;
+    req.header_callback = SyncContext.headerCallback;
+    req.data_callback = SyncContext.dataCallback;
+    req.done_callback = SyncContext.doneCallback;
+    req.error_callback = SyncContext.errorCallback;
+    req.shutdown_callback = SyncContext.shutdownCallback;
 
     const frame_id = req.frame_id;
     self.blocking_requests.putNoClobber(self.allocator, frame_id, transfer.id) catch |err| {
@@ -1168,6 +1167,7 @@ pub fn syncRequest(self: *Client, allocator: Allocator, req: Request, owner: *Ow
         .done, .shutdown => return .{
             .status = sync_ctx.status,
             .body = sync_ctx.body,
+            .arena = sync_ctx.arena,
         },
         .err => |e| return e,
     }
@@ -1250,7 +1250,7 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
             .sync_wait => self.inbox.popIf(allowDuringSyncWait),
         } orelse return;
 
-        defer msg.deinit(self.arena_pool);
+        defer msg.deinit();
 
         switch (msg.payload) {
             .cdp => |*c| cdp.onMessage(c) catch |err| {
@@ -1429,7 +1429,7 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
         );
         if (wait_for_interception) {
             self.intercepted += 1;
-            if (comptime IS_DEBUG) {
+            if (comptime lp.IS_DEBUG) {
                 log.debug(.http, "wait for auth interception", .{ .intercepted = self.intercepted });
             }
 
@@ -1448,11 +1448,24 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
     // Handle redirects: reuse the same connection to preserve TCP state.
     // A redirect status without a Location header is not a redirect, it's a
     // final response and falls through so its body is delivered.
-    if (effective_err == null) {
+    // When the server closes the TLS connection without a close_notify alert,
+    // BoringSSL reports RecvError. If we already received valid HTTP headers,
+    // this is a normal end-of-body (the connection closure signals the end
+    // of the response per HTTP/1.1 when there is no Content-Length).
+    // We must check this before endTransfer, which may reset the easy handle.
+    const is_conn_close_recv = blk: {
+        const err = effective_err orelse break :blk false;
+        if (err != error.RecvError) break :blk false;
+        const hdr = msg.conn.getResponseHeader("connection", 0) orelse break :blk true;
+        break :blk std.ascii.eqlIgnoreCase(hdr.value, "close");
+    };
+
+    if (effective_err == null or is_conn_close_recv) {
         const status = try msg.conn.getResponseCode();
         if (isRedirectStatus(status)) {
             if (msg.conn.getResponseHeader("location", 0)) |location| switch (transfer.req.redirect) {
                 .follow => {
+                    transfer.restoreInterceptHeaders();
                     try transfer.handleRedirect(location.value);
 
                     if (self.isUrlBlocked(transfer.req.url, transfer.req.internal)) {
@@ -1464,6 +1477,28 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
                     }
 
                     if (!transfer.req.internal) lp.metrics.http_redirects.incr();
+
+                    if (self.serve_mode) { // e.g. cdp
+                        var wait_for_interception = false;
+                        transfer.req.notification.dispatch(.http_request_intercept, &.{
+                            .transfer = transfer,
+                            .wait_for_interception = &wait_for_interception,
+                        });
+
+                        if (wait_for_interception) {
+                            transfer.req.notification.dispatch(.http_request_start, &.{ .transfer = transfer });
+
+                            // Same shape as the auth-interception park above:
+                            // give up the connection, wait for the CDP client.
+                            self.removeConn(msg.conn);
+                            transfer._conn = null;
+                            transfer.reset();
+                            transfer.state = .created;
+                            self.intercepted += 1;
+                            transfer.park(.intercept_request);
+                            return false;
+                        }
+                    }
 
                     const conn = transfer._conn.?;
 
@@ -1502,18 +1537,6 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
     // Transfer is done (success or error). Materialize the response into the
     // transfer's arena, release the conn, and buffer the events — user
     // callbacks run later, from dispatch(), never from here.
-
-    // When the server closes the TLS onnection without a close_notify alert,
-    // BoringSSL reports RecvError. If we already received valid HTTP headers,
-    // this is a normal end-of-body (the connection closure signals the end
-    // of the response per HTTP/1.1 when there is no Content-Length).
-    // We must check this before endTransfer, which may reset the easy handle.
-    const is_conn_close_recv = blk: {
-        const err = effective_err orelse break :blk false;
-        if (err != error.RecvError) break :blk false;
-        const hdr = msg.conn.getResponseHeader("connection", 0) orelse break :blk true;
-        break :blk std.ascii.eqlIgnoreCase(hdr.value, "close");
-    };
 
     if (effective_err != null and !is_conn_close_recv) {
         self.removeConn(msg.conn);
@@ -1630,14 +1653,12 @@ pub const Request = struct {
     loader_id: u32,
     method: Method,
     url: [:0]const u8,
-    // Empty by default; the client fills in its baseline headers (user
-    // agent, sec-ch-ua, accept-language) when none are supplied.
-    headers: http.Headers = .{ .headers = null },
     body: ?[]const u8 = null,
     cookie_jar: ?*CookieJar,
     cookie_origin: [:0]const u8,
     resource_type: ResourceType,
     redirect: RedirectMode = .follow,
+    referrer_policy: ?referrer.Policy = null,
     credentials: ?[:0]const u8 = null,
     notification: *Notification,
     timeout_ms: u32 = 0,
@@ -1695,18 +1716,20 @@ pub const Request = struct {
         const written = aw.written();
         return written.ptr[0 .. written.len - 1 :0];
     }
-
-    pub fn deinit(self: *const Request) void {
-        self.headers.deinit();
-    }
 };
 
 pub const SyncResponse = struct {
     status: u16,
     body: std.ArrayList(u8),
 
-    pub fn deinit(self: *SyncResponse, allocator: Allocator) void {
-        self.body.deinit(allocator);
+    // Owns `body`. Null when the response had nothing to buffer. Callers that
+    // keep `body` past this call take the arena instead of releasing it.
+    arena: ?*lp.Arena,
+
+    pub fn deinit(self: *SyncResponse) void {
+        if (self.arena) |arena| {
+            arena.release();
+        }
     }
 };
 
@@ -1714,7 +1737,7 @@ pub const SyncResponse = struct {
 // challenge. The auth retry goes straight back to the network — it already
 // passed the request-side pipeline on its first attempt.
 pub fn continueTransfer(self: *Client, transfer: *Transfer) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "continue transfer", .{ .intercepted = self.intercepted });
     }
 
@@ -1729,7 +1752,7 @@ pub fn continueTransfer(self: *Client, transfer: *Transfer) !void {
 // gate, re-entering the pipeline at the step after interception. The CDP
 // command may have mutated req (url / method / headers / body) first.
 pub fn continueIntercepted(self: *Client, transfer: *Transfer) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         lp.assert(self.intercepted > 0, "Client.continueIntercepted", .{ .value = self.intercepted });
     }
 
@@ -1751,7 +1774,7 @@ pub fn fulfillIntercepted(
     headers: []const http.Header,
     body: ?[]const u8,
 ) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         lp.assert(self.intercepted > 0, "Client.fulfillIntercepted", .{ .value = self.intercepted });
     }
 
@@ -1873,7 +1896,7 @@ pub const Owner = struct {
 
 pub const Transfer = struct {
     id: u32 = 0,
-    arena: Allocator,
+    arena: *lp.Arena,
 
     owner: ?*Owner,
     owner_node: std.DoublyLinkedList.Node = .{},
@@ -1897,6 +1920,8 @@ pub const Transfer = struct {
     res: Response = .{},
     client: *Client,
 
+    req_headers: std.ArrayList(RequestHeader) = .empty,
+
     start_time: u64,
 
     _notified_fail: bool = false,
@@ -1912,6 +1937,10 @@ pub const Transfer = struct {
     // incremented by reset func.
     _tries: u8 = 0,
     _redirect_count: u8 = 0,
+
+    // Fetch.continueRequest header overrides apply to a single network hop. We
+    // need to restore (and hence capture) the original headers.
+    _intercept_original_headers: ?[]const RequestHeader = null,
 
     // Linked into client.pending_queue while .queued; reused to link the
     // retired transfer into client.graveyard (deinit unlinks it from the
@@ -2076,7 +2105,7 @@ pub const Transfer = struct {
         if (self._retired) {
             // transfer.deinit should be called once. But _retired and the graveyard
             // are a safety net born out of UAFs.
-            if (comptime IS_DEBUG) {
+            if (comptime lp.IS_DEBUG) {
                 lp.assert(false, "Transfer.deinit on retired transfer", .{ .id = self.id });
             }
             return;
@@ -2123,12 +2152,11 @@ pub const Transfer = struct {
         // Any concurrent CDP lookup by id will now see this transfer as gone.
         _ = self.client.transfers.remove(self.id);
 
-        self.req.deinit();
         if (self.owner) |o| {
             o.removeTransfer(self);
         }
 
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             // Any callback on a corpse is a bug — fail loudly instead of
             // silently running user code from a retired transfer.
             self.req.start_callback = null;
@@ -2284,7 +2312,7 @@ pub const Transfer = struct {
     // error_callback fires from the dispatcher, never from the caller's
     // stack.
     pub fn failAsync(self: *Transfer, err: anyerror) void {
-        self._events.append(self.arena, .{ .err = err }) catch {
+        self._events.append(self.arena.allocator(), .{ .err = err }) catch {
             // Can't buffer (OOM): failing inline beats losing the error.
             return self.abort(err);
         };
@@ -2298,7 +2326,7 @@ pub const Transfer = struct {
         if (self.state == .delivering) {
             return;
         }
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             lp.assert(
                 self.state == .created or self.state == .inflight,
                 "Transfer.scheduleDispatch",
@@ -2327,7 +2355,7 @@ pub const Transfer = struct {
         // http_status reflects the final response only. Internal requests
         // (robots.txt) are tracked by the robots_* metrics instead.
         if (self.res.stream.started) {
-            try self._events.append(self.arena, .done);
+            try self._events.append(self.arena.allocator(), .done);
             self.scheduleDispatch();
             return;
         }
@@ -2338,7 +2366,7 @@ pub const Transfer = struct {
             lp.metrics.http_response_size_bytes.observe(body.len);
         }
 
-        try self._events.ensureUnusedCapacity(self.arena, 4);
+        try self._events.ensureUnusedCapacity(self.arena.allocator(), 4);
         self._events.appendAssumeCapacity(.start);
         self._events.appendAssumeCapacity(.header);
         if (body.len > 0) {
@@ -2365,20 +2393,12 @@ pub const Transfer = struct {
     // Serve a cache entry as this transfer's response. Takes ownership of
     // `cached` (file-backed bodies are read into the arena and closed).
     fn bufferCached(self: *Transfer, cached: Cache.CachedResponse) !void {
-        const arena = self.arena;
-
         const body: []const u8 = switch (cached.data) {
             .buffer => |b| b,
-            .file => |f| blk: {
-                defer f.file.close(lp.io);
-                const buf = try arena.alloc(u8, f.len);
-                const n = try f.file.readPositionalAll(lp.io, buf, f.offset);
-                break :blk buf[0..n];
-            },
         };
 
-        self.setResponseHead(cached.metadata.status, cached.metadata.content_type);
-        self.res.headers = cached.metadata.headers;
+        self.setResponseHead(cached.status, cached.content_type);
+        self.res.headers = cached.headers;
         self._from_cache = true;
         self._content_length = body.len;
         try self.bufferEvents(body);
@@ -2435,7 +2455,7 @@ pub const Transfer = struct {
         self.res.header.?.url = (try arena.dupeZ(u8, std.mem.span(self.res.header.?.url))).ptr;
 
         var it = HeaderIterator{ .curl = .{ .conn = conn } };
-        const headers = try it.collect(arena);
+        const headers = try it.collect(arena.allocator());
         self.res.headers = headers.items;
 
         if (self.req.cookie_jar) |jar| {
@@ -2474,12 +2494,29 @@ pub const Transfer = struct {
             try conn.setGetMode();
         }
 
-        var header_list = req.headers;
-        try conn.secretHeaders(&header_list, &client.network.config.http_headers);
-        try conn.setHeaders(&header_list);
+        // Build the conn's curl_slist from req_headers, fresh on every
+        // attempt so redirect/auth retries pick up mutations and never
+        // accumulate duplicates.
+        conn.clearHeaders();
+        const arena = self.arena.allocator();
+        for (self.req_headers.items) |hdr| {
+            try conn.addHeader(arena, hdr.name, hdr.value);
+        }
+        if (req.body != null) {
+            // Browsers never send Expect: 100-continue; libcurl generates it
+            // for HTTP/1.1 requests whose body exceeds 1MB
+            // (EXPECT_100_THRESHOLD), which stalls the request ~1s against
+            // servers/proxies that never answer the interim response. An
+            // empty value ("Expect:") suppresses the generated header. Only
+            // requests with a body can trigger it, and over HTTP/2 curl never
+            // generates it, so the entry is inert there.
+            try conn.addRawHeader("Expect:");
+        }
+        try conn.secretHeaders(&client.network.config.http_headers);
+        try conn.commitHeaders();
 
         // Add cookies from cookie jar.
-        if (try self.req.getCookieString(self.arena)) |cookies| {
+        if (try self.req.getCookieString(self.arena.allocator())) |cookies| {
             try conn.setCookies(@ptrCast(cookies.ptr));
         }
 
@@ -2517,7 +2554,7 @@ pub const Transfer = struct {
     }
 
     fn buildResponseHeader(self: *Transfer, conn: *const http.Connection) !void {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             std.debug.assert(self.res.header == null);
         }
 
@@ -2569,6 +2606,21 @@ pub const Transfer = struct {
             }
         }
 
+        // A Referrer-Policy header on a redirect response applies to the
+        // remaining hops.
+        if (req.referrer_policy != null) {
+            // referrer-policy is re-applied on every hop.
+            var i: usize = 0;
+            while (conn.getResponseHeader("referrer-policy", i)) |hdr| : (i += 1) {
+                if (referrer.parseHeader(hdr.value)) |policy| {
+                    req.referrer_policy = policy;
+                }
+                if (i >= hdr.amount) {
+                    break;
+                }
+            }
+        }
+
         // base_url and location are owned by curl; applyRedirectTarget resolves a
         // fresh arena-owned copy that gets stored in transfer.req.url.
         const base_url = try conn.getEffectiveUrl();
@@ -2594,7 +2646,7 @@ pub const Transfer = struct {
                 break :blk "";
             }
 
-            const resolved = try URL.resolve(arena, base, location, .{});
+            const resolved = try URL.resolve(arena.allocator(), base, location, .{});
 
             // RFC 7231 §7.1.2: if the Location value has no fragment, the redirect
             // inherits the fragment from the URI used to generate the request.
@@ -2603,7 +2655,7 @@ pub const Transfer = struct {
             if (URL.getHash(resolved).len == 0) {
                 const original_hash = URL.getHash(transfer.req.url);
                 if (original_hash.len != 0) {
-                    break :blk try std.mem.joinZ(arena, "", &.{ resolved, original_hash });
+                    break :blk try std.mem.joinZ(arena.allocator(), "", &.{ resolved, original_hash });
                 }
             }
             break :blk resolved;
@@ -2615,6 +2667,21 @@ pub const Transfer = struct {
         if (status == 301 or status == 302 or status == 303) {
             req.method = .GET;
             req.body = null;
+        }
+
+        if (req.referrer_policy) |policy| {
+            // Referer header was applied based on the original target. It
+            // needs to be updated based on the redirect target. A redirect can
+            // only strip it (full -> origin -> none), so we can use whatever
+            // value we have now as the base
+            if (transfer.findRequestHeader("referer")) |current| {
+                const alloc = arena.allocator();
+                if (try referrer.compute(alloc, policy, try alloc.dupeZ(u8, current), req.url)) |value| {
+                    try transfer.setHeader("Referer", value, .{});
+                } else {
+                    transfer.removeHeader("Referer");
+                }
+            }
         }
     }
 
@@ -2644,27 +2711,106 @@ pub const Transfer = struct {
         self.req.credentials = userpwd;
     }
 
-    pub fn replaceRequestHeaders(self: *Transfer, allocator: Allocator, headers: []const http.Header) !void {
-        self.req.headers.deinit();
+    pub const RequestHeader = struct {
+        name: []const u8,
+        value: []const u8,
+        source: HeaderSource = .user_agent,
+    };
 
-        var buf: std.ArrayList(u8) = .empty;
-        var new_headers = try self.client.newHeaders();
-        for (headers) |hdr| {
-            // safe to re-use this buffer, because Headers.add because curl copies
-            // the value we pass into curl_slist_append.
-            defer buf.clearRetainingCapacity();
-            try std.fmt.format(buf.writer(allocator), "{s}: {s}", .{ hdr.name, hdr.value });
-            try buf.append(allocator, 0); // null terminated
-            try new_headers.add(buf.items[0 .. buf.items.len - 1 :0]);
+    // Who put the header on the request. CORS cares: only non-safelisted
+    // author (i.e. script-set) headers trigger a preflight.
+    pub const HeaderSource = enum { user_agent, author };
+
+    pub const HeaderOpts = struct {
+        source: HeaderSource = .user_agent,
+    };
+
+    pub fn addHeader(self: *Transfer, name: []const u8, value: []const u8, opts: HeaderOpts) !void {
+        const arena = self.arena.allocator();
+        try self.req_headers.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .value = try arena.dupe(u8, value),
+            .source = opts.source,
+        });
+    }
+
+    pub fn findRequestHeader(self: *const Transfer, name: []const u8) ?[]const u8 {
+        for (self.req_headers.items) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
+                return hdr.value;
+            }
         }
-        self.req.headers = new_headers;
+        return null;
+    }
+
+    fn removeHeader(self: *Transfer, name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.req_headers.items.len) {
+            if (std.ascii.eqlIgnoreCase(self.req_headers.items[i].name, name)) {
+                _ = self.req_headers.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    // Adds, replacing every existing header with the same case-insensitive name
+    pub fn setHeader(self: *Transfer, name: []const u8, value: []const u8, opts: HeaderOpts) !void {
+        var found = false;
+        var i: usize = 0;
+        while (i < self.req_headers.items.len) {
+            const hdr = &self.req_headers.items[i];
+            if (std.ascii.eqlIgnoreCase(hdr.name, name) == false) {
+                i += 1;
+                continue;
+            }
+            if (found) {
+                _ = self.req_headers.orderedRemove(i);
+                continue;
+            }
+            found = true;
+            hdr.value = try self.arena.allocator().dupe(u8, value);
+            hdr.source = opts.source;
+            i += 1;
+        }
+        if (!found) {
+            try self.addHeader(name, value, opts);
+        }
+    }
+
+    // The client's baseline headers, added to every request at creation.
+    fn seedHeaders(self: *Transfer) !void {
+        for (self.client.baselineHeaders()) |hdr| {
+            try self.addHeader(hdr.name, hdr.value, .{});
+        }
+    }
+
+    // CDP Fetch.continueRequest: the intercepting client supplies the
+    // complete header set, replacing whatever the request carried.
+    pub fn replaceRequestHeaders(self: *Transfer, headers: []const http.Header) !void {
+        lp.assert(self._intercept_original_headers == null, "Transfer.replaceRequestHeaders", .{ .id = self.id });
+        self._intercept_original_headers = try self.arena.allocator().dupe(RequestHeader, self.req_headers.items);
+        self.req_headers.clearRetainingCapacity();
+        try self.seedHeaders();
+        for (headers) |hdr| {
+            try self.setHeader(hdr.name, hdr.value, .{});
+        }
+    }
+
+    fn restoreInterceptHeaders(self: *Transfer) void {
+        const headers = self._intercept_original_headers orelse return;
+        self.req_headers.clearRetainingCapacity();
+        // _intercept_original_headers.items.len MIGHT be larger than self.req_headers.items.len
+        // but the capacity never shrank from when _intercept_original_headers WAS req_headers.
+        self.req_headers.appendSliceAssumeCapacity(headers);
+        self._intercept_original_headers = null;
     }
 
     // abortAuthChallenge is called when an auth challenge interception is
     // abort. We don't call self.releaseConn here b/c it has been done
     // before interception process.
     pub fn abortAuthChallenge(self: *Transfer) void {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.http, "abort auth transfer", .{ .intercepted = self.client.intercepted });
         }
 
@@ -2674,7 +2820,7 @@ pub const Transfer = struct {
 
     fn dataCallback(buffer: [*]const u8, chunk_count: usize, chunk_len: usize, data: *anyopaque) callconv(.c) usize {
         // libcurl should only ever emit 1 chunk at a time
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             std.debug.assert(chunk_count == 1);
         }
 
@@ -2705,7 +2851,7 @@ pub const Transfer = struct {
                     res.callback_error = error.ResponseTooLarge;
                     return http.writefunc_error;
                 }
-                res.buffer.ensureTotalCapacity(transfer.arena, cl) catch {};
+                res.buffer.ensureTotalCapacityPrecise(transfer.arena.allocator(), cl) catch {};
             }
         }
 
@@ -2739,7 +2885,7 @@ pub const Transfer = struct {
             return http.writefunc_error;
         }
 
-        res.buffer.appendSlice(transfer.arena, chunk) catch |err| {
+        res.buffer.appendSlice(transfer.arena.allocator(), chunk) catch |err| {
             res.callback_error = err;
             return http.writefunc_error;
         };
@@ -2756,16 +2902,16 @@ pub const Transfer = struct {
         if (res.stream.started == false) {
             // we haven't delivered the start/header events yet
             try self.materializeResponse(conn);
-            try self._events.ensureUnusedCapacity(self.arena, 3);
+            try self._events.ensureUnusedCapacity(self.arena.allocator(), 3);
             self._events.appendAssumeCapacity(.start);
             self._events.appendAssumeCapacity(.header);
             res.stream.started = true;
         }
         // append the data to whatever data we already have (but haven't delivered)
-        try res.buffer.appendSlice(self.arena, chunk);
+        try res.buffer.appendSlice(self.arena.allocator(), chunk);
         if (res.stream.data_queued == false) {
             res.stream.data_queued = true;
-            try self._events.append(self.arena, .stream_data);
+            try self._events.append(self.arena.allocator(), .stream_data);
         }
 
         switch (self.state) {
@@ -2773,7 +2919,7 @@ pub const Transfer = struct {
             // deliver() is mid-batch on this transfer; its loop consumes
             // events appended behind its cursor.
             .delivering => {},
-            else => if (comptime IS_DEBUG) {
+            else => if (comptime lp.IS_DEBUG) {
                 lp.assert(false, "Transfer.scheduleStreamDispatch", .{ .state = self.state });
             },
         }
@@ -3037,7 +3183,7 @@ const Synthetic = struct {
         var content_type: []const u8 = "";
 
         if (std.mem.startsWith(u8, url, "data:")) {
-            const parsed = try data_url.parse(arena, url);
+            const parsed = try data_url.parse(arena.allocator(), url);
             content_type = parsed.content_type;
             body = parsed.body;
         } else {
@@ -3085,32 +3231,38 @@ test "HttpClient: isFetchInterceptionMethod rejects unrelated methods" {
 }
 
 test "HttpClient: allowDuringSyncWait allows ping/close/disconnect" {
+    const test_arena = try testing.test_app.arena_pool.acquire(.tiny, "HttpClient test");
+    defer test_arena.release();
+
     var ping_msg = Inbox.Message{
-        .arena = testing.allocator,
+        .arena = test_arena,
         .payload = .{ .ping = "" },
     };
     try testing.expect(allowDuringSyncWait(&ping_msg));
 
     var close_msg = Inbox.Message{
-        .arena = testing.allocator,
+        .arena = test_arena,
         .payload = .close,
     };
     try testing.expect(allowDuringSyncWait(&close_msg));
 
     var disconnect_msg = Inbox.Message{
-        .arena = testing.allocator,
+        .arena = test_arena,
         .payload = .{ .disconnect = null },
     };
     try testing.expect(allowDuringSyncWait(&disconnect_msg));
 
     var disconnect_err_msg = Inbox.Message{
-        .arena = testing.allocator,
+        .arena = test_arena,
         .payload = .{ .disconnect = error.PeerClosed },
     };
     try testing.expect(allowDuringSyncWait(&disconnect_err_msg));
 }
 
 test "HttpClient: allowDuringSyncWait allows only Fetch interception CDP methods" {
+    const test_arena = try testing.test_app.arena_pool.acquire(.tiny, "HttpClient test");
+    defer test_arena.release();
+
     var raw_buf: [16]u8 = undefined;
 
     inline for ([_][]const u8{
@@ -3120,7 +3272,7 @@ test "HttpClient: allowDuringSyncWait allows only Fetch interception CDP methods
         "Fetch.continueWithAuth",
     }) |method| {
         var msg = Inbox.Message{
-            .arena = testing.allocator,
+            .arena = test_arena,
             .payload = .{ .cdp = .{
                 .raw = &raw_buf,
                 .input = .{ .method = method },
@@ -3131,6 +3283,9 @@ test "HttpClient: allowDuringSyncWait allows only Fetch interception CDP methods
 }
 
 test "HttpClient: allowDuringSyncWait denies non-Fetch CDP methods" {
+    const test_arena = try testing.test_app.arena_pool.acquire(.tiny, "HttpClient test");
+    defer test_arena.release();
+
     var raw_buf: [16]u8 = undefined;
 
     inline for ([_][]const u8{
@@ -3142,7 +3297,7 @@ test "HttpClient: allowDuringSyncWait denies non-Fetch CDP methods" {
         "",
     }) |method| {
         var msg = Inbox.Message{
-            .arena = testing.allocator,
+            .arena = test_arena,
             .payload = .{ .cdp = .{
                 .raw = &raw_buf,
                 .input = .{ .method = method },
@@ -3153,6 +3308,9 @@ test "HttpClient: allowDuringSyncWait denies non-Fetch CDP methods" {
 }
 
 test "HttpClient: isSyncWaitInterrupt matches teardown methods, close and disconnect" {
+    const test_arena = try testing.test_app.arena_pool.acquire(.tiny, "HttpClient test");
+    defer test_arena.release();
+
     var raw_buf: [16]u8 = undefined;
 
     inline for ([_][]const u8{
@@ -3161,7 +3319,7 @@ test "HttpClient: isSyncWaitInterrupt matches teardown methods, close and discon
         "Page.close",
     }) |method| {
         var msg = Inbox.Message{
-            .arena = testing.allocator,
+            .arena = test_arena,
             .payload = .{ .cdp = .{
                 .raw = &raw_buf,
                 .input = .{ .method = method },
@@ -3170,15 +3328,18 @@ test "HttpClient: isSyncWaitInterrupt matches teardown methods, close and discon
         try testing.expect(isSyncWaitInterrupt(&msg));
     }
 
-    var close_msg = Inbox.Message{ .arena = testing.allocator, .payload = .close };
+    var close_msg = Inbox.Message{ .arena = test_arena, .payload = .close };
     try testing.expect(isSyncWaitInterrupt(&close_msg));
 
-    var disconnect_msg = Inbox.Message{ .arena = testing.allocator, .payload = .{ .disconnect = null } };
+    var disconnect_msg = Inbox.Message{ .arena = test_arena, .payload = .{ .disconnect = null } };
     try testing.expect(isSyncWaitInterrupt(&disconnect_msg));
 }
 
 test "HttpClient: isSyncWaitInterrupt ignores ping and non-teardown CDP methods" {
-    var ping_msg = Inbox.Message{ .arena = testing.allocator, .payload = .{ .ping = "" } };
+    const test_arena = try testing.test_app.arena_pool.acquire(.tiny, "HttpClient test");
+    defer test_arena.release();
+
+    var ping_msg = Inbox.Message{ .arena = test_arena, .payload = .{ .ping = "" } };
     try testing.expect(!isSyncWaitInterrupt(&ping_msg));
 
     var raw_buf: [16]u8 = undefined;
@@ -3190,7 +3351,7 @@ test "HttpClient: isSyncWaitInterrupt ignores ping and non-teardown CDP methods"
         "",
     }) |method| {
         var msg = Inbox.Message{
-            .arena = testing.allocator,
+            .arena = test_arena,
             .payload = .{ .cdp = .{
                 .raw = &raw_buf,
                 .input = .{ .method = method },
@@ -3253,6 +3414,80 @@ test "HttpClient: URL blocking exempts internal transfers" {
     try client.setBlockedUrls(&.{"*example.test*"});
     try testing.expect(client.isUrlBlocked("https://example.test/script.js", false));
     try testing.expect(!client.isUrlBlocked("https://example.test/robots.txt", true));
+}
+
+test "HttpClient: Transfer.setHeader replaces by case-insensitive name" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const arena = try pool.acquire(.small, "test");
+    defer arena.release();
+
+    var transfer = Transfer{
+        .arena = arena,
+        .owner = null,
+        .req = .{
+            .frame_id = 0,
+            .loader_id = 0,
+            .method = .GET,
+            .url = "http://example.com/",
+            .cookie_jar = null,
+            .cookie_origin = "",
+            .resource_type = .document,
+            .notification = undefined,
+            .shutdown_callback = noopShutdown,
+        },
+        .client = undefined,
+        .id = 1,
+        .start_time = 0,
+    };
+
+    try transfer.addHeader("User-Agent", "Lightpanda/1.0", .{});
+    try transfer.addHeader("X-Twice", "a", .{});
+    try transfer.addHeader("x-twice", "b", .{});
+
+    // replaces in place, collapsing duplicates
+    try transfer.setHeader("user-agent", "Custom/1.0", .{});
+    try transfer.setHeader("X-TWICE", "c", .{ .source = .author });
+    // no match: appends
+    try transfer.setHeader("X-New", "yes", .{});
+
+    const headers = transfer.req_headers.items;
+    try testing.expectEqual(3, headers.len);
+    try testing.expectEqual("User-Agent", headers[0].name);
+    try testing.expectEqual("Custom/1.0", headers[0].value);
+    try testing.expectEqual("X-Twice", headers[1].name);
+    try testing.expectEqual("c", headers[1].value);
+    try testing.expectEqual(.author, headers[1].source);
+    try testing.expectEqual("X-New", headers[2].name);
+    try testing.expectEqual("yes", headers[2].value);
+}
+
+test "HttpClient: Fetch header overrides restore after one hop" {
+    const original = [_]Transfer.RequestHeader{
+        .{ .name = "User-Agent", .value = "original" },
+        .{ .name = "X-Original", .value = "yes" },
+    };
+    var overridden = [_]Transfer.RequestHeader{
+        .{ .name = "User-Agent", .value = "override" },
+        .{ .name = "X-Override", .value = "yes" },
+    };
+
+    var transfer: Transfer = undefined;
+    transfer.req_headers = .{ .items = &overridden, .capacity = overridden.len };
+    transfer._intercept_original_headers = &original;
+    transfer.restoreInterceptHeaders();
+
+    try testing.expectEqual(2, transfer.req_headers.items.len);
+    try testing.expectEqual("User-Agent", transfer.req_headers.items[0].name);
+    try testing.expectEqual("original", transfer.req_headers.items[0].value);
+    try testing.expectEqual("X-Original", transfer.req_headers.items[1].name);
+    try testing.expectEqual("yes", transfer.req_headers.items[1].value);
+    try testing.expectEqual(null, transfer._intercept_original_headers);
+
+    // idempotent once restored
+    transfer.restoreInterceptHeaders();
+    try testing.expectEqual(2, transfer.req_headers.items.len);
 }
 
 test "HttpClient: fulfillIntercepted survives a done_callback that tears down the owner" {

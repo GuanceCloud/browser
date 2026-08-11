@@ -33,8 +33,6 @@ const WorkerGlobalScope = @import("WorkerGlobalScope.zig");
 
 const MessageEvent = @import("event/MessageEvent.zig");
 
-const Allocator = std.mem.Allocator;
-
 const DedicatedWorkerGlobalScope = @This();
 
 pub const Proto = WorkerGlobalScope;
@@ -54,7 +52,7 @@ _pending_messages: std.ArrayList(?js.Value.Global) = .empty,
 
 pub fn init(worker: *Worker, url: [:0]const u8) !*DedicatedWorkerGlobalScope {
     return WorkerGlobalScope.init(
-        worker._arena,
+        worker._arena.allocator(),
         url,
         .dedicated,
         DedicatedWorkerGlobalScope{
@@ -152,7 +150,7 @@ fn scheduleMessage(self: *DedicatedWorkerGlobalScope, cloned_data: ?js.Value.Glo
     const session = wgs._session;
 
     const message_arena = try session.getArena(.tiny, "DedicatedWorkerGlobalScope.receiveMessage");
-    errdefer session.releaseArena(message_arena);
+    errdefer message_arena.release();
 
     const callback = try message_arena.create(ReceiveMessageCallback);
     callback.* = .{
@@ -163,7 +161,6 @@ fn scheduleMessage(self: *DedicatedWorkerGlobalScope, cloned_data: ?js.Value.Glo
 
     try wgs.js.scheduler.add(callback, ReceiveMessageCallback.run, 0, .{
         .name = "WorkerGlobalScope.receiveMessage",
-        .low_priority = false,
         .finalizer = ReceiveMessageCallback.cancelled,
     });
 }
@@ -184,7 +181,7 @@ pub fn drainPendingMessages(self: *DedicatedWorkerGlobalScope) void {
 
 const ReceiveMessageCallback = struct {
     data: ?js.Value.Global,
-    arena: Allocator,
+    arena: *lp.Arena,
     worker_scope: *DedicatedWorkerGlobalScope,
 
     fn cancelled(ctx: *anyopaque) void {
@@ -196,7 +193,7 @@ const ReceiveMessageCallback = struct {
     }
 
     fn deinit(self: *ReceiveMessageCallback) void {
-        self.worker_scope._proto._session.releaseArena(self.arena);
+        self.arena.release();
     }
 
     fn run(ctx: *anyopaque) !?u32 {

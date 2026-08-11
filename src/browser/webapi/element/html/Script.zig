@@ -19,6 +19,7 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../../../js/js.zig");
+const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
 
 const Node = @import("../../Node.zig");
@@ -30,18 +31,18 @@ const Script = @This();
 
 pub const Proto = HtmlElement;
 
-_proto: *HtmlElement,
+_proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
 _src: []const u8 = "",
 _executed: bool = false,
 // dynamic scripts are forced to be async by default
 _force_async: bool = true,
 
 pub fn asElement(self: *Script) *Element {
-    return self._proto._proto;
+    return Factory.protoOf(self).asElement();
 }
 
 pub fn asConstElement(self: *const Script) *const Element {
-    return self._proto._proto;
+    return Factory.protoOf(self).asElement();
 }
 
 pub fn asNode(self: *Script) *Node {
@@ -194,7 +195,7 @@ pub const Build = struct {
 
 const testing = @import("../../../../testing.zig");
 test "WebApi: Script" {
-    const filter: testing.LogFilter = .init(&.{.http});
-    defer filter.deinit();
+    testing.silenceLog(&.{.http});
+    testing.expectLog(&.{ .js, .js });
     try testing.htmlRunner("element/html/script", .{});
 }

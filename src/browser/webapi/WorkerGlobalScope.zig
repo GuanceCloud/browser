@@ -38,6 +38,7 @@ const Crypto = @import("Crypto.zig");
 const Console = @import("Console.zig");
 const Navigator = @import("Navigator.zig");
 const Timers = @import("Timers.zig");
+const Scheduler = @import("Scheduler.zig");
 const EventTarget = @import("EventTarget.zig");
 const Performance = @import("Performance.zig");
 const WorkerLocation = @import("WorkerLocation.zig");
@@ -48,9 +49,6 @@ const CookieStore = @import("storage/CookieStore.zig");
 const MessagePort = @import("MessagePort.zig");
 const SharedWorkerGlobalScope = @import("SharedWorkerGlobalScope.zig");
 const DedicatedWorkerGlobalScope = @import("DedicatedWorkerGlobalScope.zig");
-
-const builtin = @import("builtin");
-const IS_DEBUG = builtin.mode == .Debug;
 
 const log = lp.log;
 const Allocator = std.mem.Allocator;
@@ -73,6 +71,8 @@ _identity: JS.Identity = .{},
 _http_owner: HttpClient.Owner,
 
 arena: Allocator,
+_call_arena: *lp.Arena,
+_local_arena: *lp.Arena,
 call_arena: Allocator,
 local_arena: Allocator,
 url: [:0]const u8,
@@ -116,6 +116,7 @@ _cookie_store: ?*CookieStore = null,
 _location: WorkerLocation,
 
 _timers: Timers = .{},
+_scheduler: Scheduler = .{},
 
 pub const Type = union(enum) {
     shared: *SharedWorkerGlobalScope,
@@ -135,10 +136,10 @@ pub fn init(
     const session = frame._session;
 
     const call_arena = try session.getArena(.small, "WorkerGlobalScope.call_arena");
-    errdefer session.releaseArena(call_arena);
+    errdefer call_arena.release();
 
     const local_arena = try session.getArena(.small, "WorkerGlobalScope.local_arena");
-    errdefer session.releaseArena(local_arena);
+    errdefer local_arena.release();
 
     const factory = frame._factory;
     const leaf = try Factory.chainedWithAllocator(arena, .{
@@ -148,8 +149,10 @@ pub fn init(
             .arena = arena,
             .origin = frame.origin,
             .js = undefined,
-            .call_arena = call_arena,
-            .local_arena = local_arena,
+            ._call_arena = call_arena,
+            ._local_arena = local_arena,
+            .call_arena = call_arena.allocator(),
+            .local_arena = local_arena.allocator(),
             ._frame = frame,
             ._page = frame._page,
             ._session = session,
@@ -181,8 +184,8 @@ pub fn init(
     );
 
     self.js = try session.browser.env.createWorkerContext(self, .{
-        .call_arena = call_arena,
-        .local_arena = local_arena,
+        .call_arena = call_arena.allocator(),
+        .local_arena = local_arena.allocator(),
         .identity_arena = arena,
         .identity = &self._identity,
     });
@@ -216,8 +219,8 @@ pub fn deinit(self: *WorkerGlobalScope) void {
 
     page.revokeBlobUrlsFor(self._frame_id);
     browser.env.destroyContext(self.js);
-    session.releaseArena(self.call_arena);
-    session.releaseArena(self.local_arena);
+    self._call_arena.release();
+    self._local_arena.release();
 }
 
 pub fn base(self: *const WorkerGlobalScope) [:0]const u8 {
@@ -253,8 +256,8 @@ pub fn hasDirectListeners(self: *WorkerGlobalScope, target: *EventTarget, typ: [
 
 // Workers don't have their own Referer; per spec, dedicated worker requests
 // use the parent document's URL. Delegate to the owning frame.
-pub fn headersForRequest(self: *WorkerGlobalScope, headers: *HttpClient.Headers) !void {
-    return self._frame.headersForRequest(headers);
+pub fn headersForRequest(self: *WorkerGlobalScope, transfer: *HttpClient.Transfer) !void {
+    return self._frame.headersForRequest(transfer);
 }
 
 pub fn isSameOrigin(self: *const WorkerGlobalScope, url: [:0]const u8) bool {
@@ -267,7 +270,12 @@ pub fn isSameOrigin(self: *const WorkerGlobalScope, url: [:0]const u8) bool {
 }
 
 pub fn makeRequest(self: *WorkerGlobalScope, req: HttpClient.Request) !void {
-    return self._session.browser.http_client.request(req, &self._http_owner);
+    const transfer = try self._session.browser.http_client.newRequest(req, &self._http_owner);
+    {
+        errdefer transfer.deinit();
+        try self.headersForRequest(transfer);
+    }
+    return transfer.submit();
 }
 
 // Two-phase variant; see HttpClient.newRequest for the ownership contract.
@@ -299,6 +307,10 @@ pub fn getCrypto(self: *WorkerGlobalScope) *Crypto {
 
 pub fn getNavigator(self: *WorkerGlobalScope) *Navigator {
     return &self._navigator;
+}
+
+pub fn getScheduler(self: *WorkerGlobalScope) *Scheduler {
+    return &self._scheduler;
 }
 
 pub fn performance(self: *WorkerGlobalScope) *Performance {
@@ -355,7 +367,7 @@ pub fn structuredClone(_: *const WorkerGlobalScope, value: JS.Value) !JS.Value {
 }
 
 pub fn unhandledPromiseRejection(self: *WorkerGlobalScope, no_handler: bool, rejection: JS.PromiseRejection) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.js, "unhandled rejection", .{
             .target = "worker",
             .value = rejection.reason(),
@@ -392,12 +404,13 @@ pub fn importScripts(self: *WorkerGlobalScope, urls: []const [:0]const u8) !void
     }
 
     const session = self._session;
-    const arena = try session.getArena(.large, "importScript");
-    defer session.releaseArena(arena);
+    // HttpClient will take out a larger arena for the body, if necessary
+    const arena = try session.getArena(.small, "importScript");
+    defer arena.release();
 
     for (urls) |url| {
-        defer session.arena_pool.resetRetain(arena);
-        try self.importScript(arena, url);
+        defer arena.resetRetain();
+        try self.importScript(arena.allocator(), url);
     }
 }
 
@@ -408,16 +421,12 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
 
     const http_client = &session.browser.http_client;
 
-    var headers = try http_client.newHeaders();
-    try self.headersForRequest(&headers);
-
-    const response = http_client.syncRequest(arena, .{
+    const transfer = http_client.newRequest(.{
         .url = resolved_url,
         .method = .GET,
         .frame_id = self._frame_id,
         .document_frame_id = self._frame._frame_id,
         .loader_id = self._loader_id,
-        .headers = headers,
         .cookie_jar = &session.cookie_jar,
         .cookie_origin = self.url,
         .resource_type = .script,
@@ -427,6 +436,16 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
         log.warn(.http, "importScript", .{ .url = resolved_url, .err = err });
         return error.NetworkError;
     };
+    {
+        errdefer transfer.deinit();
+        try self.headersForRequest(transfer);
+    }
+
+    var response = http_client.syncRequest(transfer) catch |err| {
+        log.warn(.http, "importScript", .{ .url = resolved_url, .err = err });
+        return error.NetworkError;
+    };
+    defer response.deinit();
 
     if (response.status != 200) {
         log.warn(.http, "importScript", .{ .url = resolved_url, .status = response.status });
@@ -491,7 +510,7 @@ pub fn reportError(self: *WorkerGlobalScope, err: JS.Value) !void {
     // We still dispatch so that addEventListener('error', ...) listeners fire.
     try self.dispatch(self.asEventTarget(), event, null, .{});
 
-    if (comptime builtin.is_test == false) {
+    if (comptime lp.IS_TEST == false) {
         if (!event._prevent_default) {
             log.warn(.js, "worker.reportError", .{
                 .message = error_event._message,
@@ -579,6 +598,7 @@ pub const JsApi = struct {
     pub const console = bridge.accessor(WorkerGlobalScope.getConsole, WorkerGlobalScope.setConsole, .{});
     pub const crypto = bridge.accessor(WorkerGlobalScope.getCrypto, null, .{});
     pub const navigator = bridge.accessor(WorkerGlobalScope.getNavigator, null, .{});
+    pub const scheduler = bridge.accessor(WorkerGlobalScope.getScheduler, null, .{});
     pub const performance = bridge.accessor(struct {
         // Unnecessary, But, our WebAPI getters are ALWAYS `fn getPerformance()...`.
         // But for performance, we _need_ to have fn performance() *Performance to

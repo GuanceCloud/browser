@@ -41,7 +41,7 @@ pub fn init(frame: *Frame) !*Range {
 // frame's main document.
 pub fn initIn(container: *Node, frame: *Frame) !*Range {
     const arena = try frame.getArena(.medium, "Range");
-    errdefer frame.releaseArena(arena);
+    errdefer arena.release();
     const range = try frame._factory.abstractRange(arena, Range{ ._proto = undefined }, frame);
     range._proto._start_container = container;
     range._proto._end_container = container;
@@ -328,7 +328,7 @@ pub fn intersectsNode(self: *const Range, node: *Node) bool {
 
 pub fn cloneRange(self: *const Range, frame: *Frame) !*Range {
     const arena = try frame.getArena(.medium, "Range.clone");
-    errdefer frame.releaseArena(arena);
+    errdefer arena.release();
 
     const clone = try frame._factory.abstractRange(arena, Range{ ._proto = undefined }, frame);
     clone._proto._end_offset = self._proto._end_offset;
@@ -364,7 +364,7 @@ pub fn insertNode(self: *Range, node: *Node, frame: *Frame) !void {
                 // records browsers do (one for the split-off node, one for
                 // the inserted node).
                 const second = try t.splitText(offset, frame);
-                _ = try parent.insertBefore(node, second._proto.asNode(), frame);
+                _ = try parent.insertBefore(node, second.asCData().asNode(), frame);
             } else {
                 _ = try parent.insertBefore(node, container.nextSibling(), frame);
             }

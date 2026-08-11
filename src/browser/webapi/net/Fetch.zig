@@ -32,7 +32,6 @@ const Response = @import("Response.zig");
 const log = lp.log;
 const Execution = js.Execution;
 const Transfer = HttpClient.Transfer;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Fetch = @This();
 
@@ -69,7 +68,7 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
         }
     }
 
-    const response = try Response.init(null, .{ .status = 0 }, exec);
+    const response = try Response.initPending(exec);
     errdefer response.deinit(exec.page);
 
     const fetch = try response._arena.create(Fetch);
@@ -85,14 +84,8 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
     };
 
     const session = exec.session;
-    const http_client = &session.browser.http_client;
-    var headers = try http_client.newHeaders();
-    if (request._headers) |h| {
-        try h.populateHttpHeader(exec.call_arena, &headers);
-    }
-    try exec.headersForRequest(&headers);
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "fetch", .{ .url = request._url });
     }
 
@@ -109,7 +102,6 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
         .frame_id = exec.frameId(),
         .loader_id = exec.loaderId(),
         .body = request._body,
-        .headers = headers,
         .resource_type = .fetch,
         .cookie_jar = cookie_jar,
         .cookie_origin = exec.url.*,
@@ -128,6 +120,14 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
         // OOM-class; nothing was committed and no callback fired.
         return resolver.promise();
     };
+
+    {
+        errdefer transfer.deinit();
+        if (request._headers) |h| {
+            try h.populateRequestHeaders(transfer);
+        }
+        try exec.headersForRequest(transfer);
+    }
 
     // Held for Response.deinit's abort; the error, shutdown and done
     // callbacks clear it.
@@ -152,12 +152,12 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
 
     const arena = self._response._arena;
     if (transfer.getContentLength()) |cl| {
-        try self._buf.ensureTotalCapacity(arena, cl);
+        try self._buf.ensureTotalCapacityPrecise(arena.allocator(), cl);
     }
 
     const res = self._response;
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "request header", .{
             .source = "fetch",
             .url = self._url,
@@ -183,8 +183,8 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
 
     // Determine response type based on origin comparison
     const exec = self._exec;
-    const requesting_origin = URL.getOrigin(arena, exec.url.*) catch null;
-    const response_origin = URL.getOrigin(arena, res._url) catch null;
+    const requesting_origin = URL.getOrigin(arena.allocator(), exec.url.*) catch null;
+    const response_origin = URL.getOrigin(arena.allocator(), res._url) catch null;
 
     if (requesting_origin) |fo| {
         if (response_origin) |ro| {
@@ -218,7 +218,7 @@ fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
         }
     }
 
-    try self._buf.appendSlice(self._response._arena, data);
+    try self._buf.appendSlice(self._response._arena.allocator(), data);
 }
 
 fn httpDoneCallback(ctx: *anyopaque) !void {
@@ -240,6 +240,7 @@ fn httpDoneCallback(ctx: *anyopaque) !void {
 
     const js_val = try ls.local.zigValueToJs(self._response, .{});
     self._owns_response = false;
+    response._arena.report();
     return ls.toLocal(self._resolver).resolve("fetch done", js_val);
 }
 

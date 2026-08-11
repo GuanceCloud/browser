@@ -162,8 +162,8 @@ fn performSearch(cmd: *CDP.Command) !void {
 
     if (isXPathQuery(params.query)) {
         const arena = try frame.getArena(.medium, "DOM.performSearch");
-        defer frame.releaseArena(arena);
-        const nodes = try xpath.searchAll(arena, root, params.query, frame);
+        defer arena.release();
+        const nodes = try xpath.searchAll(arena.allocator(), root, params.query, frame);
         return finishSearch(cmd, bc, nodes);
     }
 
@@ -346,32 +346,33 @@ fn resolveNode(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
-    var ls: ?js.Local.Scope = null;
-    defer if (ls) |*_ls| {
-        _ls.deinit();
+    var ls: js.Local.Scope = undefined;
+    var ls_open = false;
+    defer if (ls_open) {
+        ls.deinit();
     };
 
     if (params.executionContextId) |context_id| blk: {
-        ls = undefined;
-        frame.js.localScope(&ls.?);
-        if (ls.?.local.debugContextId() == context_id) {
+        frame.js.localScope(&ls);
+        ls_open = true;
+        if (ls.local.debugContextId() == context_id) {
             break :blk;
         }
         // not the default scope, check the other ones
         for (bc.isolated_worlds.items) |isolated_world| {
-            ls.?.deinit();
-            ls = null;
+            ls.deinit();
+            ls_open = false;
 
             const ctx = (isolated_world.context orelse return error.ContextNotFound);
-            ls = undefined;
-            ctx.localScope(&ls.?);
-            if (ls.?.local.debugContextId() == context_id) {
+            ctx.localScope(&ls);
+            ls_open = true;
+            if (ls.local.debugContextId() == context_id) {
                 break :blk;
             }
         } else return error.ContextNotFound;
     } else {
-        ls = undefined;
-        frame.js.localScope(&ls.?);
+        frame.js.localScope(&ls);
+        ls_open = true;
     }
 
     const input_node_id = params.nodeId orelse params.backendNodeId orelse return error.InvalidParam;
@@ -380,7 +381,7 @@ fn resolveNode(cmd: *CDP.Command) !void {
     // node._node is a *DOMNode we need this to be able to find its most derived type e.g. Node -> Element -> HTMLElement
     // So we use the Node.Union when retrieve the value from the environment
     const remote_object = try bc.inspector_session.getRemoteObject(
-        &ls.?.local,
+        &ls.local,
         params.objectGroup orelse "",
         node.dom,
     );
@@ -655,13 +656,13 @@ fn fileFromDiskPath(path: []const u8, page: *Page) !*File {
     // Mirror File.init: a Blob and File sharing one reference-counted arena,
     // but read the bytes straight off disk into it (single copy, no JS parts).
     const arena = try page.getArena(.large, "File");
-    errdefer page.releaseArena(arena);
+    errdefer arena.release();
 
-    const data = try std.Io.Dir.cwd().readFileAlloc(lp.io, path, arena, .limited(MAX_FILE_BYTES));
+    const data = try std.Io.Dir.cwd().readFileAlloc(lp.io, path, arena.allocator(), .limited(MAX_FILE_BYTES));
     const stat = try std.Io.Dir.cwd().statFile(lp.io, path, .{});
     const basename = std.fs.path.basename(path);
 
-    const file = try Factory.chainedWithAllocator(arena, .{
+    const file = try Factory.chainedWithAllocator(arena.allocator(), .{
         Blob{
             ._rc = .{},
             ._arena = arena,
