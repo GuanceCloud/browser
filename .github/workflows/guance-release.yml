@@ -44,7 +44,7 @@ jobs:
             cpu_flag: -Dcpu=generic
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -55,6 +55,42 @@ jobs:
         with:
           os: linux
           arch: ${{ matrix.arch }}
+          install-v8: ${{ matrix.arch == 'x86_64' && 'true' || 'false' }}
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: matrix.arch == 'aarch64'
+        with:
+          repository: lightpanda-io/zig-v8-fork
+          ref: ec68fae9e869b0cb47b8eea972d1472bfa669933 # v0.5.4
+          path: .zig-v8-fork
+
+      - name: Build V8 on Ubuntu 22.04
+        if: matrix.arch == 'aarch64'
+        working-directory: .zig-v8-fork
+        run: |
+          sudo apt-get install -yq libglib2.0-dev lld
+          llvm_archive="$RUNNER_TEMP/LLVM-23.1.0-Linux-ARM64.tar.xz"
+          wget -q --tries=3 \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.0/LLVM-23.1.0-Linux-ARM64.tar.xz \
+            -O "$llvm_archive"
+          echo "cfb31bfc713ef453248bf5bd026312f838ad6c52c25623e987cb6a340f3050d4  $llvm_archive" \
+            | sha256sum -c -
+          sudo mkdir -p /opt/llvm-23
+          sudo tar -xJf "$llvm_archive" -C /opt/llvm-23 --strip-components=1
+          /opt/llvm-23/bin/clang++ --version
+          clang_dir=/opt/llvm-23/lib/clang/23
+          if [[ ! -e "$clang_dir/lib/aarch64-unknown-linux-gnu/libclang_rt.builtins.a" ]]; then
+            builtins=$(find "$clang_dir" -name 'libclang_rt.builtins-aarch64.a' -print -quit)
+            test -n "$builtins"
+            sudo mkdir -p "$clang_dir/lib/aarch64-unknown-linux-gnu"
+            sudo ln -s "$builtins" "$clang_dir/lib/aarch64-unknown-linux-gnu/libclang_rt.builtins.a"
+          fi
+          sed -i 's|/usr/lib/llvm-23|/opt/llvm-23|' build.zig
+          zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe build-v8
+          v8_lib=$(find .lp-cache -path '*/out/linux/release_*/obj/zig/libc_v8.a' -print -quit)
+          test -n "$v8_lib"
+          mkdir -p ../v8
+          ln -s "$(realpath "$v8_lib")" ../v8/libc_v8.a
 
       - name: Build V8 snapshot
         run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
@@ -75,6 +111,17 @@ jobs:
           mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-linux
           chmod 0755 lightpanda-${{ matrix.arch }}-linux
           ./lightpanda-${{ matrix.arch }}-linux version
+
+      - name: Verify Ubuntu 22.04 glibc compatibility
+        run: |
+          binary="lightpanda-${{ matrix.arch }}-linux"
+          max_glibc=$(readelf --version-info "$binary" \
+            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' \
+            | sort -Vu \
+            | tail -1)
+          test -n "$max_glibc"
+          echo "Highest required glibc symbol: $max_glibc"
+          test "$(printf '%s\n%s\n' "$max_glibc" GLIBC_2.35 | sort -V | tail -1)" = GLIBC_2.35
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

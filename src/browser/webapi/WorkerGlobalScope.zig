@@ -36,7 +36,7 @@ const ScriptManagerBase = @import("../ScriptManagerBase.zig");
 const Event = @import("Event.zig");
 const Crypto = @import("Crypto.zig");
 const Console = @import("Console.zig");
-const Navigator = @import("Navigator.zig");
+const WorkerNavigator = @import("WorkerNavigator.zig");
 const Timers = @import("Timers.zig");
 const Scheduler = @import("Scheduler.zig");
 const EventTarget = @import("EventTarget.zig");
@@ -105,7 +105,7 @@ _message_ports: std.DoublyLinkedList = .{},
 _proto: *EventTarget,
 _console: Console = .init,
 _crypto: Crypto = .init,
-_navigator: Navigator = .init,
+_navigator: WorkerNavigator = .init,
 _performance: Performance,
 _idb_factory: ?*idb.IDBFactory = null,
 _on_error: ?JS.Function.Global = null,
@@ -143,7 +143,7 @@ pub fn init(
 
     const factory = frame._factory;
     const leaf = try Factory.chainedWithAllocator(arena, .{
-        EventTarget{ ._type = undefined },
+        EventTarget{ ._type = .worker_global_scope },
         WorkerGlobalScope{
             .url = url,
             .arena = arena,
@@ -173,7 +173,6 @@ pub fn init(
     });
     const self = leaf._proto;
     self._type = @unionInit(Type, @tagName(tag), leaf);
-    self._proto._type = .{ .worker_global_scope = self };
 
     self._http_owner = .init(&frame._page.blob_urls, &self.origin);
 
@@ -262,11 +261,7 @@ pub fn headersForRequest(self: *WorkerGlobalScope, transfer: *HttpClient.Transfe
 
 pub fn isSameOrigin(self: *const WorkerGlobalScope, url: [:0]const u8) bool {
     const current_origin = self.origin orelse return false;
-
-    if (!std.mem.startsWith(u8, url, current_origin)) {
-        return false;
-    }
-    return std.mem.eql(u8, URL.getHost(url), URL.getHost(current_origin));
+    return URL.isSameOrigin(url, current_origin);
 }
 
 pub fn makeRequest(self: *WorkerGlobalScope, req: HttpClient.Request) !void {
@@ -275,7 +270,7 @@ pub fn makeRequest(self: *WorkerGlobalScope, req: HttpClient.Request) !void {
         errdefer transfer.deinit();
         try self.headersForRequest(transfer);
     }
-    return transfer.submit();
+    transfer.submit() catch {};
 }
 
 // Two-phase variant; see HttpClient.newRequest for the ownership contract.
@@ -305,7 +300,7 @@ pub fn getCrypto(self: *WorkerGlobalScope) *Crypto {
     return &self._crypto;
 }
 
-pub fn getNavigator(self: *WorkerGlobalScope) *Navigator {
+pub fn getNavigator(self: *WorkerGlobalScope) *WorkerNavigator {
     return &self._navigator;
 }
 
@@ -441,7 +436,7 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
         try self.headersForRequest(transfer);
     }
 
-    var response = http_client.syncRequest(transfer) catch |err| {
+    var response = transfer.submitSync() catch |err| {
         log.warn(.http, "importScript", .{ .url = resolved_url, .err = err });
         return error.NetworkError;
     };

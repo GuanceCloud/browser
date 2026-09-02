@@ -64,13 +64,13 @@ const ResolvedOptions = struct {
 };
 
 pub const ObserveOptions = struct {
-    attributes: ?bool = null,
+    attributeFilter: ?[]const []const u8 = null,
     attributeOldValue: ?bool = null,
-    childList: bool = false,
+    attributes: ?bool = null,
     characterData: ?bool = null,
     characterDataOldValue: ?bool = null,
+    childList: bool = false,
     subtree: bool = false,
-    attributeFilter: ?[]const []const u8 = null,
 };
 
 pub fn init(callback: js.Function.Global, frame: *Frame) !*MutationObserver {
@@ -468,4 +468,106 @@ pub const JsApi = struct {
 const testing = @import("../../testing.zig");
 test "WebApi: MutationObserver" {
     try testing.htmlRunner("mutation_observer", .{});
+}
+
+test "WebApi: runaway MutationObserver delivery is disconnected" {
+    testing.silenceLog(&.{.frame});
+
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    try ls.local.eval(
+        \\(function() {
+        \\  const target = document.createElement('div');
+        \\  const children = [target.appendChild(document.createElement('div'))];
+        \\  let n = 0;
+        \\  const mutate = () => {
+        \\    n++;
+        \\    for (const child of children) child.style.transform = `translate3d(${n}px,0,0)`;
+        \\  };
+        \\  new MutationObserver(() => {
+        \\    setTimeout(mutate, 0);
+        \\    mutate();
+        \\  }).observe(target, {attributes: true, subtree: true, attributeFilter: ['style']});
+        \\  mutate();
+        \\})()
+    , null);
+
+    for (0..200) |_| {
+        frame.js.env.runMicrotasks();
+        try frame.js.env.runMacrotasks();
+        if (!Frame.observers.hasMutationObservers(frame)) break;
+    }
+
+    try testing.expectEqual(false, Frame.observers.hasMutationObservers(frame));
+}
+
+// Production watchdog path (lightpanda-io/browser#3130 follow-up): the
+// terminate lands inside a MutationObserver callback, so ExecutionTerminated
+// must unwind out of deliverRecords, stay sticky against further V8 entries,
+// and leave the observer machinery usable after a top-level cancel.
+test "WebApi: MutationObserver requested termination unwinds delivery" {
+    const v8 = js.v8;
+    testing.expectLog(&.{ .frame, .frame });
+
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+
+    const State = struct {
+        env: *js.Env,
+
+        fn kill(self: *@This()) void {
+            self.env.requestTerminate();
+        }
+    };
+    var state = State{ .env = env };
+    const kill_cb = local.newCallback(State.kill, &state);
+
+    // An observer whose callback wedges until the requested termination
+    // lands, like a storefront spinning inside its MutationObserver callback
+    // when the watchdog fires.
+    const setup = try local.exec(
+        \\(function(kill) {
+        \\  const target = document.createElement('div');
+        \\  window.__delivered = 0;
+        \\  window.__wedge = true;
+        \\  window.__target = target;
+        \\  new MutationObserver(() => {
+        \\    window.__delivered++;
+        \\    if (window.__wedge) { kill(); for(;;){} }
+        \\  }).observe(target, { attributes: true });
+        \\  target.setAttribute('x', '1');
+        \\})
+    , null);
+    const setup_fn = js.Function{ .local = local, .handle = @ptrCast(setup.handle) };
+    try setup_fn.call(void, .{kill_cb});
+
+    // The queued delivery microtask wedges; the terminate unwinds it and the
+    // unwind must stop at deliverRecords without another V8 entry.
+    env.runMicrotasks();
+
+    try testing.expectEqual(true, env.terminatePending());
+    try testing.expectEqual(false, v8.v8__Isolate__IsExecutionTerminating(env.isolate.handle));
+
+    // Sticky: no fresh eval may enter V8 while the termination is pending.
+    try testing.expectError(error.ExecutionTerminated, local.exec("1 + 1", null));
+
+    // A top-level cancel restores execution AND mutation delivery.
+    env.cancelTerminate();
+    try testing.expectEqual(1, try (try local.exec("window.__delivered", null)).toI32());
+    try local.eval("window.__wedge = false; window.__target.setAttribute('x', '2');", null);
+    env.runMicrotasks();
+    try testing.expectEqual(2, try (try local.exec("window.__delivered", null)).toI32());
 }
