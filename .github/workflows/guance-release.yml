@@ -76,6 +76,17 @@ jobs:
           chmod 0755 lightpanda-${{ matrix.arch }}-linux
           ./lightpanda-${{ matrix.arch }}-linux version
 
+      - name: Verify Ubuntu 22.04 glibc compatibility
+        run: |
+          binary="lightpanda-${{ matrix.arch }}-linux"
+          max_glibc=$(readelf --version-info "$binary" \
+            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' \
+            | sort -Vu \
+            | tail -1)
+          test -n "$max_glibc"
+          echo "Highest required glibc symbol: $max_glibc"
+          test "$(printf '%s\n%s\n' "$max_glibc" GLIBC_2.35 | sort -V | tail -1)" = GLIBC_2.35
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lightpanda-${{ matrix.arch }}-linux
