@@ -68,15 +68,24 @@ jobs:
         if: matrix.arch == 'aarch64'
         working-directory: .zig-v8-fork
         run: |
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 22
           sudo apt-get install -yq libglib2.0-dev lld
-          clang_dir=/usr/lib/llvm-22/lib/clang/22
-          sudo ln -nsf "$clang_dir/lib/linux/libclang_rt.builtins-aarch64.a" "$clang_dir/lib/linux/libclang_rt.builtins.a"
-          sudo ln -nsf "$clang_dir/lib/linux" "$clang_dir/lib/aarch64-unknown-linux-gnu"
-          sudo ln -nsf "$clang_dir" /usr/lib/llvm-22/lib/clang/23
-          sed -i 's|/usr/lib/llvm-23|/usr/lib/llvm-22|' build.zig
+          llvm_archive="$RUNNER_TEMP/LLVM-23.1.0-Linux-ARM64.tar.xz"
+          wget -q --tries=3 \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.0/LLVM-23.1.0-Linux-ARM64.tar.xz \
+            -O "$llvm_archive"
+          echo "cfb31bfc713ef453248bf5bd026312f838ad6c52c25623e987cb6a340f3050d4  $llvm_archive" \
+            | sha256sum -c -
+          sudo mkdir -p /opt/llvm-23
+          sudo tar -xJf "$llvm_archive" -C /opt/llvm-23 --strip-components=1
+          /opt/llvm-23/bin/clang++ --version
+          clang_dir=/opt/llvm-23/lib/clang/23
+          if [[ ! -e "$clang_dir/lib/aarch64-unknown-linux-gnu/libclang_rt.builtins.a" ]]; then
+            builtins=$(find "$clang_dir" -name 'libclang_rt.builtins-aarch64.a' -print -quit)
+            test -n "$builtins"
+            sudo mkdir -p "$clang_dir/lib/aarch64-unknown-linux-gnu"
+            sudo ln -s "$builtins" "$clang_dir/lib/aarch64-unknown-linux-gnu/libclang_rt.builtins.a"
+          fi
+          sed -i 's|/usr/lib/llvm-23|/opt/llvm-23|' build.zig
           zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe build-v8
           v8_lib=$(find .lp-cache -path '*/out/linux/release_*/obj/zig/libc_v8.a' -print -quit)
           test -n "$v8_lib"
