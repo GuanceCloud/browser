@@ -19,6 +19,7 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 const Frame = @import("Frame.zig");
+const LimitedWriter = @import("../LimitedWriter.zig");
 const Node = @import("webapi/Node.zig");
 const Slot = @import("webapi/element/html/Slot.zig");
 const IFrame = @import("webapi/element/html/IFrame.zig");
@@ -28,6 +29,9 @@ pub const Opts = struct {
     with_frames: bool = false,
     strip: Opts.Strip = .{},
     shadow: Opts.Shadow = .rendered,
+    /// Soft cap: output is cut at a UTF-8 boundary and a truncation marker
+    /// appended.
+    max_bytes: ?u32 = null,
 
     pub const Strip = packed struct(u4) {
         js: bool = false,
@@ -36,7 +40,7 @@ pub const Opts = struct {
         invisible: bool = false,
     };
 
-    pub const Shadow = enum {
+    pub const Shadow = union(enum) {
         // Skip shadow DOM entirely (innerHTML/outerHTML)
         skip,
 
@@ -45,10 +49,30 @@ pub const Opts = struct {
 
         // Resolve slot elements (like what actually gets rendered)
         rendered,
+
+        // Element/ShadowRoot.getHTML can control how it handles shadow elements
+        declarative: Declarative,
+
+        pub const Declarative = struct {
+            // Serialize shadow roots whose `serializable` flag is set
+            serializable_shadow_roots: bool = false,
+            // Serialize these roots regardless of their flags or mode
+            shadow_roots: []const *Node.ShadowRoot = &.{},
+        };
     };
 };
 
 pub fn root(doc: *Node.Document, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
+    if (opts.max_bytes == null) return rootUncapped(doc, opts, writer, frame);
+
+    var lw: LimitedWriter = .init(writer, opts.max_bytes);
+    rootUncapped(doc, opts, &lw.writer, frame) catch |err| {
+        if (!lw.truncated) return err;
+        try writer.writeAll(LimitedWriter.truncation_marker);
+    };
+}
+
+fn rootUncapped(doc: *Node.Document, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
     if (doc.is(Node.Document.HTMLDocument)) |html_doc| {
         blk: {
             // Ideally we just render the doctype which is part of the document
@@ -65,16 +89,22 @@ pub fn root(doc: *Node.Document, opts: Opts, writer: *std.Io.Writer, frame: *Fra
         if (opts.with_base) {
             const parent = if (html_doc.getHead()) |head| head.asNode() else doc.asNode();
             const base = try doc.createElement("base", null, frame);
-            try base.setAttributeSafe(comptime .wrap("base"), .wrap(frame.base()), frame);
+            try base.setAttributeSafe(comptime .wrap("href"), .wrap(frame.base()), frame);
             _ = try parent.insertBefore(base.asNode(), parent.firstChild(), frame);
         }
     }
 
-    return deep(doc.asNode(), opts, writer, frame);
+    return _deep(doc.asNode(), opts, false, writer, frame);
 }
 
 pub fn deep(node: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame) error{WriteFailed}!void {
-    return _deep(node, opts, false, writer, frame);
+    if (opts.max_bytes == null) return _deep(node, opts, false, writer, frame);
+
+    var lw: LimitedWriter = .init(writer, opts.max_bytes);
+    _deep(node, opts, false, &lw.writer, frame) catch |err| {
+        if (!lw.truncated) return err;
+        try writer.writeAll(LimitedWriter.truncation_marker);
+    };
 }
 
 fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Writer, frame: *Frame) error{WriteFailed}!void {
@@ -101,7 +131,7 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
         },
         .element => {
             const el = node.subtype(Node.Element);
-            if (shouldStripElement(el, opts, frame)) {
+            if (shouldStripElement(el, opts.strip, frame)) {
                 return;
             }
 
@@ -125,20 +155,30 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
                     return writer.writeAll("</slot>");
                 }
             }
-            if (opts.shadow != .skip) {
-                if (frame._element_shadow_roots.get(el)) |shadow| {
-                    try children(shadow.asNode(), opts, writer, frame);
-                    // In rendered mode, light DOM is only shown through slots, not directly
-                    if (opts.shadow == .rendered) {
-                        // Skip rendering light DOM children
-                        if (!isVoidElement(el)) {
-                            try writer.writeAll("</");
-                            try writer.writeAll(el.getTagNameDump());
-                            try writer.writeByte('>');
+            switch (opts.shadow) {
+                .skip => {},
+                .complete, .rendered => {
+                    if (el.hostedShadowRoot(frame)) |shadow| {
+                        try children(shadow.asNode(), opts, writer, frame);
+                        // In rendered mode, light DOM is only shown through slots, not directly
+                        if (opts.shadow == .rendered) {
+                            // Skip rendering light DOM children
+                            if (!isVoidElement(el)) {
+                                try writer.writeAll("</");
+                                try writer.writeAll(el.getTagNameDump());
+                                try writer.writeByte('>');
+                            }
+                            return;
                         }
-                        return;
                     }
-                }
+                },
+                .declarative => |declarative| {
+                    if (el.hostedShadowRoot(frame)) |shadow| {
+                        if (shouldSerializeShadow(shadow, declarative)) {
+                            try writeDeclarativeShadow(shadow, opts, writer, frame);
+                        }
+                    }
+                },
             }
 
             if (opts.with_frames and el.is(IFrame) != null) {
@@ -199,6 +239,22 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
     }
 }
 
+// Element.getHTML / ShadowRoot.getHTML
+pub fn getHTML(node: *Node, declarative: Opts.Shadow.Declarative, writer: *std.Io.Writer, frame: *Frame) !void {
+    const opts = Opts{ .shadow = .{ .declarative = declarative } };
+    if (node.is(Node.Element)) |el| {
+        if (el.hostedShadowRoot(frame)) |shadow| {
+            if (shouldSerializeShadow(shadow, declarative)) {
+                // if the element's shadowroot tree is rendered before its
+                // children (assume the opts say that it should serialize the
+                // shadowroot at all (i.e. shouldSerializeShadow).
+                try writeDeclarativeShadow(shadow, opts, writer, frame);
+            }
+        }
+    }
+    return children(node, opts, writer, frame);
+}
+
 pub fn children(parent: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
     var it = parent.childrenIterator();
     while (it.next()) |child| {
@@ -247,6 +303,39 @@ pub fn toJSON(node: *Node, writer: *std.json.Stringify) !void {
     try writer.endObject();
 }
 
+fn shouldSerializeShadow(shadow: *const Node.ShadowRoot, declarative: Opts.Shadow.Declarative) bool {
+    if (declarative.serializable_shadow_roots and shadow._serializable) {
+        return true;
+    }
+    for (declarative.shadow_roots) |sr| {
+        if (sr == shadow) {
+            // if it's explictly requested, it's serialized even if _serialized == false
+            return true;
+        }
+    }
+    return false;
+}
+
+// The spec's "attach a declarative shadow root" serialization: attribute order
+// is fixed, and boolean attributes serialize with an explicit ="".
+fn writeDeclarativeShadow(shadow: *Node.ShadowRoot, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
+    try writer.writeAll("<template shadowrootmode=\"");
+    try writer.writeAll(@tagName(shadow._mode));
+    try writer.writeByte('"');
+    if (shadow._delegates_focus) {
+        try writer.writeAll(" shadowrootdelegatesfocus=\"\"");
+    }
+    if (shadow._serializable) {
+        try writer.writeAll(" shadowrootserializable=\"\"");
+    }
+    if (shadow._clonable) {
+        try writer.writeAll(" shadowrootclonable=\"\"");
+    }
+    try writer.writeByte('>');
+    try children(shadow.asNode(), opts, writer, frame);
+    try writer.writeAll("</template>");
+}
+
 fn dumpSlotContent(slot: *Slot, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
     const assigned = slot.assignedNodes(null, frame) catch return;
 
@@ -259,25 +348,29 @@ fn dumpSlotContent(slot: *Slot, opts: Opts, writer: *std.Io.Writer, frame: *Fram
     }
 }
 
-fn isVoidElement(el: *const Node.Element) bool {
-    return switch (el._type) {
-        .html => switch (el.subtype(Node.Element.Html)._type) {
-            .br, .hr, .img, .input, .link, .meta => true,
-            else => false,
-        },
-        .svg => false,
+fn isVoidElement(el: *Node.Element) bool {
+    if (el._namespace != .html) {
+        // only html has void tags
+        return false;
+    }
+
+    return switch (el.getTag()) {
+        .area, .base, .br, .col, .embed, .hr, .img, .input, .link, .meta, .param, .source, .track => true,
+        // <wbr> has no dedicated Tag, so it lands in Html.Unknown.
+        .unknown => el.as(Node.Element.Html.Unknown)._tag_name.eql(comptime .wrap("wbr")),
+        else => false,
     };
 }
 
-fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
+pub fn shouldStripElement(el: *Node.Element, strip: Opts.Strip, frame: *Frame) bool {
     // Fast path: with no strip flags set (every innerHTML/outerHTML call)
-    if (@as(u4, @bitCast(opts.strip)) == 0) {
+    if (@as(u4, @bitCast(strip)) == 0) {
         return false;
     }
 
     const tag_name = el.getTagNameDump();
 
-    if (opts.strip.js) {
+    if (strip.js) {
         if (std.mem.eql(u8, tag_name, "script")) return true;
         if (std.mem.eql(u8, tag_name, "noscript")) return true;
 
@@ -295,7 +388,7 @@ fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
         }
     }
 
-    if (opts.strip.css or opts.strip.ui) {
+    if (strip.css or strip.ui) {
         if (std.mem.eql(u8, tag_name, "style")) return true;
 
         if (std.mem.eql(u8, tag_name, "link")) {
@@ -305,7 +398,7 @@ fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
         }
     }
 
-    if (opts.strip.ui) {
+    if (strip.ui) {
         if (std.mem.eql(u8, tag_name, "img")) return true;
         if (std.mem.eql(u8, tag_name, "picture")) return true;
         if (std.mem.eql(u8, tag_name, "video")) return true;
@@ -315,7 +408,7 @@ fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
         if (std.mem.eql(u8, tag_name, "iframe")) return true;
     }
 
-    if (opts.strip.invisible and frame._style_manager.hasAuthorDisplayNone(el)) {
+    if (strip.invisible and frame._style_manager.hasAuthorDisplayNone(el, .scan)) {
         return true;
     }
 
@@ -405,8 +498,49 @@ test "dump: default dumps the whole document" {
 test "dump: with_base injects a <base> element" {
     try expectDump(.{ .with_base = true },
         \\<!DOCTYPE html>
-        \\<html><head><base base="http://127.0.0.1:9582/src/browser/tests/dump.html"></base><style>.hidden{display:none}</style><link rel="stylesheet" href="data:text/css,"><script>var a=1;</script></head><body><h1>Title</h1><p class="hidden">secret</p><img><svg></svg><noscript>nojs</noscript><p>visible &amp; well</p></body></html>
+        \\<html><head><base href="http://127.0.0.1:9582/src/browser/tests/dump.html"><style>.hidden{display:none}</style><link rel="stylesheet" href="data:text/css,"><script>var a=1;</script></head><body><h1>Title</h1><p class="hidden">secret</p><img><svg></svg><noscript>nojs</noscript><p>visible &amp; well</p></body></html>
     );
+}
+
+test "dump: void elements have no end tag" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const doc = frame.window._document;
+    const div = try doc.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(),
+        \\<video><source src="a.mp4"><track kind="captions"></video><map><area shape="rect"></map><embed src="e.swf"><p>a<wbr>b</p><table><colgroup><col span="2"></colgroup></table>
+    );
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try deep(div.asNode(), .{}, &aw.writer, frame);
+
+    try testing.expectString(
+        \\<div><video><source src="a.mp4"><track kind="captions"></video><map><area shape="rect"></map><embed src="e.swf"><p>a<wbr>b</p><table><colgroup><col span="2"></colgroup></table></div>
+    , aw.written());
+}
+
+// There are no void SVG elements: every one gets an end tag, including those
+// whose tag name is void in HTML, and those with no dedicated Element.Tag
+// (which report .unknown, same as an unrecognized HTML element).
+test "dump: no svg element is void" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const doc = frame.window._document;
+    const div = try doc.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(),
+        \\<svg><defs><clipPath id="c"><polygon points="0,0"></polygon></clipPath></defs><use href="#c"></use><text>a<tspan>b</tspan></text><source></source><track></track><input></input><link></link><a>after</a></svg>
+    );
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try deep(div.asNode(), .{}, &aw.writer, frame);
+
+    try testing.expectString(
+        \\<div><svg><defs><clipPath id="c"><polygon points="0,0"></polygon></clipPath></defs><use href="#c"></use><text>a<tspan>b</tspan></text><source></source><track></track><input></input><link></link><a>after</a></svg></div>
+    , aw.written());
 }
 
 test "dump: strip.js removes script and noscript" {
@@ -428,6 +562,20 @@ test "dump: strip.ui removes css plus visual elements" {
         \\<!DOCTYPE html>
         \\<html><head><script>var a=1;</script></head><body><h1>Title</h1><p class="hidden">secret</p><noscript>nojs</noscript><p>visible &amp; well</p></body></html>
     );
+}
+
+test "dump: max_bytes truncates with a marker" {
+    var page = try testing.pageTest("dump.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.window._document, .{ .max_bytes = 24 }, &aw.writer, frame);
+    try testing.expectString("<!DOCTYPE html>\n<html><h" ++ LimitedWriter.truncation_marker, aw.written());
+
+    aw.clearRetainingCapacity();
+    try deep(frame.window._document.asNode().lastChild().?, .{ .max_bytes = 6 }, &aw.writer, frame);
+    try testing.expectString("<html>" ++ LimitedWriter.truncation_marker, aw.written());
 }
 
 test "dump: strip.invisible removes author display:none elements" {

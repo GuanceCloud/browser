@@ -56,6 +56,10 @@ pub fn init(arena: Allocator) Factory {
     };
 }
 
+pub fn storageAllocator(self: *Factory) Allocator {
+    return self._slab.allocator();
+}
+
 // this is a root object
 pub fn eventTarget(self: *Factory, child: anytype) !*@TypeOf(child) {
     return self.eventTargetWithAllocator(self._slab.allocator(), child);
@@ -68,7 +72,7 @@ pub fn eventTargetWithAllocator(_: *const Factory, allocator: Allocator, child: 
 
     const event_ptr = chain.get(0);
     event_ptr.* = .{
-        ._type = unionInit(EventTarget.Type, chain.get(1)),
+        ._type = typeInit(EventTarget, chain.get(1)),
     };
     chain.setLeaf(1, child);
 
